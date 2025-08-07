@@ -1,4 +1,4 @@
-from typing import Optional
+import asyncio
 import datetime
 import typer
 from pathlib import Path
@@ -19,6 +19,15 @@ from rich.tree import Tree
 from rich import box
 from rich.align import Align
 from rich.rule import Rule
+import threading
+import queue
+from typing import Optional
+
+# Remove the initial asyncio setup - let typer handle it
+# try:
+#     asyncio.get_running_loop()
+# except RuntimeError:
+#     asyncio.set_event_loop(asyncio.new_event_loop())
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -99,7 +108,7 @@ class MessageBuffer:
             if content is not None:
                 latest_section = section
                 latest_content = content
-               
+
         if latest_section and latest_content:
             # Format the current section for display
             section_titles = {
@@ -304,16 +313,16 @@ def update_display(layout, spinner_text=None):
             text_parts = []
             for item in content:
                 if isinstance(item, dict):
-                    if item.get('type') == 'text':
-                        text_parts.append(item.get('text', ''))
-                    elif item.get('type') == 'tool_use':
+                    if item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif item.get("type") == "tool_use":
                         text_parts.append(f"[Tool: {item.get('name', 'unknown')}]")
                 else:
                     text_parts.append(str(item))
-            content_str = ' '.join(text_parts)
+            content_str = " ".join(text_parts)
         elif not isinstance(content_str, str):
             content_str = str(content)
-            
+
         # Truncate message content if too long
         if len(content_str) > 200:
             content_str = content_str[:197] + "..."
@@ -394,8 +403,11 @@ def update_display(layout, spinner_text=None):
 def get_user_selections():
     """Get all user selections before starting the analysis display."""
     # Display ASCII art welcome message
-    with open("./cli/static/welcome.txt", "r") as f:
-        welcome_ascii = f.read()
+    try:
+        with open("./cli/static/welcome.txt", "r") as f:
+            welcome_ascii = f.read()
+    except FileNotFoundError:
+        welcome_ascii = "TRADING AGENTS"
 
     # Create welcome box content
     welcome_content = f"{welcome_ascii}\n"
@@ -465,12 +477,10 @@ def get_user_selections():
 
     # Step 5: OpenAI backend
     console.print(
-        create_question_box(
-            "Step 5: OpenAI backend", "Select which service to talk to"
-        )
+        create_question_box("Step 5: OpenAI backend", "Select which service to talk to")
     )
     selected_llm_provider, backend_url = select_llm_provider()
-    
+
     # Step 6: Thinking agents
     console.print(
         create_question_box(
@@ -712,6 +722,7 @@ def update_research_team_status(status):
     for agent in research_team:
         message_buffer.update_agent_status(agent, status)
 
+
 def extract_content_string(content):
     """Extract string content from various message formats."""
     if isinstance(content, str):
@@ -721,20 +732,18 @@ def extract_content_string(content):
         text_parts = []
         for item in content:
             if isinstance(item, dict):
-                if item.get('type') == 'text':
-                    text_parts.append(item.get('text', ''))
-                elif item.get('type') == 'tool_use':
+                if item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+                elif item.get("type") == "tool_use":
                     text_parts.append(f"[Tool: {item.get('name', 'unknown')}]")
             else:
                 text_parts.append(str(item))
-        return ' '.join(text_parts)
+        return " ".join(text_parts)
     else:
         return str(content)
 
-def run_analysis():
-    # First get all user selections
-    selections = get_user_selections()
 
+async def run_analysis(selections):
     # Create config with selected research depth
     config = DEFAULT_CONFIG.copy()
     config["max_debate_rounds"] = selections["research_depth"]
@@ -750,7 +759,9 @@ def run_analysis():
     )
 
     # Create result directory
-    results_dir = Path(config["results_dir"]) / selections["ticker"] / selections["analysis_date"]
+    results_dir = (
+        Path(config["results_dir"]) / selections["ticker"] / selections["analysis_date"]
+    )
     results_dir.mkdir(parents=True, exist_ok=True)
     report_dir = results_dir / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -759,6 +770,7 @@ def run_analysis():
 
     def save_message_decorator(obj, func_name):
         func = getattr(obj, func_name)
+
         @wraps(func)
         def wrapper(*args, **kwargs):
             func(*args, **kwargs)
@@ -766,10 +778,12 @@ def run_analysis():
             content = content.replace("\n", " ")  # Replace newlines with spaces
             with open(log_file, "a") as f:
                 f.write(f"{timestamp} [{message_type}] {content}\n")
+
         return wrapper
-    
+
     def save_tool_call_decorator(obj, func_name):
         func = getattr(obj, func_name)
+
         @wraps(func)
         def wrapper(*args, **kwargs):
             func(*args, **kwargs)
@@ -777,24 +791,34 @@ def run_analysis():
             args_str = ", ".join(f"{k}={v}" for k, v in args.items())
             with open(log_file, "a") as f:
                 f.write(f"{timestamp} [Tool Call] {tool_name}({args_str})\n")
+
         return wrapper
 
     def save_report_section_decorator(obj, func_name):
         func = getattr(obj, func_name)
+
         @wraps(func)
         def wrapper(section_name, content):
             func(section_name, content)
-            if section_name in obj.report_sections and obj.report_sections[section_name] is not None:
+            if (
+                section_name in obj.report_sections
+                and obj.report_sections[section_name] is not None
+            ):
                 content = obj.report_sections[section_name]
                 if content:
                     file_name = f"{section_name}.md"
                     with open(report_dir / file_name, "w") as f:
                         f.write(content)
+
         return wrapper
 
     message_buffer.add_message = save_message_decorator(message_buffer, "add_message")
-    message_buffer.add_tool_call = save_tool_call_decorator(message_buffer, "add_tool_call")
-    message_buffer.update_report_section = save_report_section_decorator(message_buffer, "update_report_section")
+    message_buffer.add_tool_call = save_tool_call_decorator(
+        message_buffer, "add_tool_call"
+    )
+    message_buffer.update_report_section = save_report_section_decorator(
+        message_buffer, "update_report_section"
+    )
 
     # Now start the display layout
     layout = create_layout()
@@ -850,14 +874,16 @@ def run_analysis():
 
                 # Extract message content and type
                 if hasattr(last_message, "content"):
-                    content = extract_content_string(last_message.content)  # Use the helper function
+                    content = extract_content_string(
+                        last_message.content
+                    )  # Use the helper function
                     msg_type = "Reasoning"
                 else:
                     content = str(last_message)
                     msg_type = "System"
 
                 # Add message to buffer
-                message_buffer.add_message(msg_type, content)                
+                message_buffer.add_message(msg_type, content)
 
                 # If it's a tool call, add it to tool calls
                 if hasattr(last_message, "tool_calls"):
@@ -947,9 +973,10 @@ def run_analysis():
                         if latest_bear:
                             message_buffer.add_message("Reasoning", latest_bear)
                             # Update research report with bear's latest analysis
+                            current_report = message_buffer.report_sections.get('investment_plan', '')
                             message_buffer.update_report_section(
                                 "investment_plan",
-                                f"{message_buffer.report_sections['investment_plan']}\n\n### Bear Researcher Analysis\n{latest_bear}",
+                                f"{current_report}\n\n### Bear Researcher Analysis\n{latest_bear}",
                             )
 
                     # Update Research Manager status and final decision
@@ -964,9 +991,10 @@ def run_analysis():
                             f"Research Manager: {debate_state['judge_decision']}",
                         )
                         # Update research report with final decision
+                        current_report = message_buffer.report_sections.get('investment_plan', '')
                         message_buffer.update_report_section(
                             "investment_plan",
-                            f"{message_buffer.report_sections['investment_plan']}\n\n### Research Manager Decision\n{debate_state['judge_decision']}",
+                            f"{current_report}\n\n### Research Manager Decision\n{debate_state['judge_decision']}",
                         )
                         # Mark all research team members as completed
                         update_research_team_status("completed")
@@ -1096,9 +1124,56 @@ def run_analysis():
         update_display(layout)
 
 
+def run_analysis_in_thread(selections):
+    """Run the async analysis in a separate thread with its own event loop."""
+    def target():
+        try:
+            # Create a new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(run_analysis(selections))
+                return result
+            finally:
+                loop.close()
+        except Exception as e:
+            console.print(f"[red]Error during analysis: {e}[/red]")
+            import traceback
+            traceback.print_exc()
+            raise
+
+    # Run in a separate thread to avoid event loop conflicts
+    import threading
+    thread = threading.Thread(target=target)
+    thread.start()
+    thread.join()
+
+
 @app.command()
 def analyze():
-    run_analysis()
+    """
+    Run trading analysis with multi-agent LLM framework.
+    """
+    try:
+        # Get user selections first (synchronously, outside any event loop)
+        console.print("[blue]Getting user selections...[/blue]")
+        selections = get_user_selections()
+        
+        # Check if we're already in an event loop
+        try:
+            asyncio.get_running_loop()
+            # If we reach here, we're in an event loop
+            console.print("[yellow]Detected running event loop, using thread-based execution[/yellow]")
+            run_analysis_in_thread(selections)
+        except RuntimeError:
+            # No running event loop, safe to use asyncio.run()
+            asyncio.run(run_analysis(selections))
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Analysis interrupted by user[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Poetry Run CLI",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "cli.main",
+            "console": "integratedTerminal",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Poetry Run (current file)",
+            "type": "debugpy", 
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

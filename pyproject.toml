@@ -3,7 +3,7 @@ name = "tradingagents"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<4.0"
 dependencies = [
     "akshare>=1.16.98",
     "backtrader>=1.9.78.123",
@@ -31,4 +31,5 @@ dependencies = [
     "tushare>=1.4.21",
     "typing-extensions>=4.14.0",
     "yfinance>=0.2.63",
+    "typer (>=0.16.0,<0.17.0)",
 ]

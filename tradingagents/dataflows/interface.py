@@ -1,4 +1,5 @@
 from typing import Annotated, Dict
+from datetime import datetime, timedelta
 from .reddit_utils import fetch_top_from_category
 from .yfin_utils import *
 from .stockstats_utils import *
@@ -704,17 +705,39 @@ def get_YFin_data(
 
 def get_stock_news_openai(ticker, curr_date):
     config = get_config()
-    client = OpenAI(base_url=config["backend_url"])
+    client = OpenAI(base_url=config["openai_url"])
 
+    curr_dt_obj = datetime.strptime(curr_date, "%Y-%m-%d")
+    start_date = (curr_dt_obj - timedelta(days=14)).strftime("%Y-%m-%d")
+    end_date = curr_date  # already a string
+    prompt = f"""
+    You are a news aggregator. Provide only factual information without analysis or interpretation.
+    Search and List all news and events for {ticker} from {start_date} to {end_date} and only those dates.
+        Include:
+        - Company announcements
+        - Earnings reports
+        - Product launches
+        - Partnership news
+        - Management changes
+        - Analyst rating changes
+        - Price target updates
+        - Any other material events
+
+        For each item, provide:
+        - Date
+        - Source (if available)
+        - Brief factual summary
+
+        Just provide the raw information, no analysis or opinions."""
     response = client.responses.create(
-        model=config["quick_think_llm"],
+        model=config["openai_model"],
         input=[
             {
                 "role": "system",
                 "content": [
                     {
                         "type": "input_text",
-                        "text": f"Can you search Social Media for {ticker} from 7 days before {curr_date} to {curr_date}? Make sure you only get the data posted during that period.",
+                        "text": prompt,
                     }
                 ],
             }
@@ -725,10 +748,10 @@ def get_stock_news_openai(ticker, curr_date):
             {
                 "type": "web_search_preview",
                 "user_location": {"type": "approximate"},
-                "search_context_size": "low",
+                "search_context_size": "high",
             }
         ],
-        temperature=1,
+        temperature=0.5,
         max_output_tokens=4096,
         top_p=1,
         store=True,
@@ -739,17 +762,35 @@ def get_stock_news_openai(ticker, curr_date):
 
 def get_global_news_openai(curr_date):
     config = get_config()
-    client = OpenAI(base_url=config["backend_url"])
+    client = OpenAI(base_url=config["openai_url"])
+    curr_dt_obj = datetime.strptime(curr_date, "%Y-%m-%d")
+    start_date = (curr_dt_obj - timedelta(days=14)).strftime("%Y-%m-%d")
+    prompt = f"""
+    You are a news aggregator. Provide only factual information without analysis or interpretation.
+    List all major global economic news from {start_date} to {curr_date}.
+    Include:
+    - Central bank decisions
+    - Economic data releases (GDP, CPI, employment)
+    - Government policy changes
+    - Geopolitical events affecting markets
+    - Major market movements
+    - Commodity price changes
 
+    For each item, provide:
+    - Date
+    - Event/headline
+    - Key numbers or facts
+
+    Just provide the raw information, no analysis or commentary."""
     response = client.responses.create(
-        model=config["quick_think_llm"],
+        model=config["openai_model"],
         input=[
             {
                 "role": "system",
                 "content": [
                     {
                         "type": "input_text",
-                        "text": f"Can you search global or macroeconomics news from 7 days before {curr_date} to {curr_date} that would be informative for trading purposes? Make sure you only get the data posted during that period.",
+                        "text": prompt,
                     }
                 ],
             }
@@ -760,10 +801,10 @@ def get_global_news_openai(curr_date):
             {
                 "type": "web_search_preview",
                 "user_location": {"type": "approximate"},
-                "search_context_size": "low",
+                "search_context_size": "high",
             }
         ],
-        temperature=1,
+        temperature=0.5,
         max_output_tokens=4096,
         top_p=1,
         store=True,
@@ -774,34 +815,104 @@ def get_global_news_openai(curr_date):
 
 def get_fundamentals_openai(ticker, curr_date):
     config = get_config()
-    client = OpenAI(base_url=config["backend_url"])
-
+    client = OpenAI(base_url=config["openai_url"])
+    curr_dt_obj = datetime.strptime(curr_date, "%Y-%m-%d")
     response = client.responses.create(
-        model=config["quick_think_llm"],
+        model=config["openai_model"],
         input=[
             {
                 "role": "system",
                 "content": [
                     {
                         "type": "input_text",
-                        "text": f"Can you search Fundamental for discussions on {ticker} during of the month before {curr_date} to the month of {curr_date}. Make sure you only get the data posted during that period. List as a table, with PE/PS/Cash flow/ etc",
+                        "text": f"""
+                        You are a meticulous FINANCIAL-DATA ASSISTANT.
+                                TASK
+                                -----
+                                For the equity ticker **{ticker}**, find the most up-to-date fundamental metrics available on or before {curr_date} use search tools:
+                                • P/E ratio
+                                • P/S ratio
+                                • P/B ratio
+                                • EV/EBITDA
+                                • PEG ratio
+                                • Market Cap
+                                • Revenue (TTM)
+                                • Net Income (TTM)
+                                • Gross Margin
+                                • Operating Margin
+                                • ROE
+                                • ROA
+                                • Debt/Equity
+                                • Current Ratio
+                                • Free Cash Flow (TTM)
+
+                                GUIDANCE FOR EACH METRIC
+                                -------------------------
+                                • **P/E ratio** — Price divided by trailing 12-month diluted EPS. Use split-adjusted price. Avoid forward estimates unless clearly marked.
+
+                                • **P/S ratio** — Market cap divided by TTM revenue. Double-check that revenue figure is *TTM*, not quarterly.
+
+                                • **P/B ratio** — Market cap divided by total shareholder equity. Use most recent *balance sheet*, not outdated summaries.
+
+                                • **EV/EBITDA** — Enterprise value divided by TTM EBITDA. Use filings or terminals like Bloomberg for accurate EV and EBITDA reconciliation. Avoid EV/EBITDA derived from forward estimates.
+
+                                • **PEG ratio** — P/E divided by forward earnings growth rate. Accept only when the growth rate is sourced from analyst consensus (e.g. FactSet, Bloomberg). Avoid back-calculated or assumed growth.
+
+                                • **Market Cap** — Share price × total diluted shares outstanding. Ensure price is from reporting date and share count includes latest dilutions.
+
+                                • **Revenue (TTM)** — Total revenue for the trailing 12 months. Extract directly from 10-K or 10-Q filings. Avoid using just latest quarter × 4.
+
+                                • **Net Income (TTM)** — Total net profit over the trailing 12 months. Validate it is *after taxes and interest*, and matches official filings.
+
+                                • **Gross Margin** — Gross profit ÷ revenue. Find this in the income statement. Avoid quoting non-GAAP adjusted margins unless clearly labelled.
+
+                                • **Operating Margin** — Operating income ÷ revenue. Use GAAP operating income (not EBITDA). Avoid pro forma adjustments.
+
+                                • **ROE** — Net income ÷ average shareholder equity. Use TTM net income and average of beginning + ending equity.
+
+                                • **ROA** — Net income ÷ average total assets. Same method as ROE, with total assets.
+
+                                • **Debt/Equity** — Total liabilities (or just interest-bearing debt) ÷ equity. Clarify which version is used.
+
+                                • **Current Ratio** — Current assets ÷ current liabilities. Use most recent quarter’s balance sheet.
+
+                                • **Free Cash Flow (TTM)** — Cash flow from operations minus capex. Prefer GAAP-compliant figures from cash flow statement. Avoid "levered FCF" unless clearly labeled.
+
+                                SOURCES
+                                -------
+                                Prioritise in this order, but widen the search if needed:
+                                1. Company filings (10-Q, 10-K, Annual/Quarterly reports, prospectuses)
+                                2. Regulatory databases (SEC EDGAR, SEDAR+, ASX Announcements, Companies House, etc.)
+                                3. Reputable aggregators (Bloomberg, Refinitiv, FactSet, S&P Capital IQ, Morningstar, Yahoo Finance, Google Finance, Macrotrends, Gurufocus)
+                                4. Mainstream financial press (WSJ, FT, CNBC, Reuters) only when the figure is explicitly quoted from company disclosures.
+
+                                If the exact reporting date isn’t available, use the nearest preceding quarter or fiscal year and cite the date of the report.
+
+                                OUTPUT FORMAT
+                                -------------
+                                Return one line per metric in plain English using this format:
+                                Metric: value   — [source], [reporting period] – data accuracy: high|medium|low
+
+                                If a metric cannot be located with reasonable effort, write:
+                                Metric: N/A   — [brief explanation] – data accuracy: low
+
+                                Be concise; list only the 14 requested metrics, nothing else.
+                        """,
                     }
                 ],
             }
         ],
         text={"format": {"type": "text"}},
-        reasoning={},
         tools=[
             {
                 "type": "web_search_preview",
                 "user_location": {"type": "approximate"},
-                "search_context_size": "low",
+                "search_context_size": "high",
             }
         ],
-        temperature=1,
-        max_output_tokens=4096,
-        top_p=1,
+        temperature=0.7,
+        top_p=1.0,
+        max_output_tokens=2048,
         store=True,
     )
-
     return response.output[1].content[0].text

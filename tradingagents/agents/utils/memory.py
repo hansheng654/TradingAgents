@@ -1,25 +1,60 @@
 import chromadb
 from chromadb.config import Settings
 from openai import OpenAI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 
 class FinancialSituationMemory:
     def __init__(self, name, config):
-        if config["backend_url"] == "http://localhost:11434/v1":
-            self.embedding = "nomic-embed-text"
+        self.config = config
+        self.backend_url = config["backend_url"]
+        
+        # Determine which API to use based on backend_url
+        if "openai" in self.backend_url.lower() or "localhost:11434" in self.backend_url:
+            self.api_type = "openai"
+            if config["backend_url"] == "http://localhost:11434/v1":
+                self.embedding = "nomic-embed-text"
+            else:
+                self.embedding = "text-embedding-3-small"
+            self.client = OpenAI(
+                base_url=config["backend_url"]
+            )
+        elif "google" in self.backend_url.lower() or "generativeai" in self.backend_url.lower():
+            self.api_type = "google"
+            self.embedding = "models/text-embedding-004"  # Google's latest embedding model
+            # Uses GOOGLE_API_KEY environment variable automatically
+            self.google_embeddings = GoogleGenerativeAIEmbeddings(
+                model=self.embedding,
+                transport="rest",
+                request_options={
+                    "timeout": 120 
+                }
+            )
+            self.client = None  # Google doesn't use the same client pattern
         else:
-            self.embedding = "text-embedding-3-small"
-        self.client = OpenAI(base_url=config["backend_url"])
+            raise ValueError(f"Unsupported backend URL: {self.backend_url}")
+
+            
         self.chroma_client = chromadb.Client(Settings(allow_reset=True))
         self.situation_collection = self.chroma_client.create_collection(name=name)
 
     def get_embedding(self, text):
-        """Get OpenAI embedding for a text"""
+        """Get embedding for text using the configured API"""
         
-        response = self.client.embeddings.create(
-            model=self.embedding, input=text
-        )
-        return response.data[0].embedding
+        if self.api_type == "openai":
+            response = self.client.embeddings.create(
+                model=self.embedding, input=text
+            )
+            return response.data[0].embedding
+        
+        elif self.api_type == "google":
+            try:
+                # Use LangChain's Google embeddings (already installed)
+                embeddings = self.google_embeddings.embed_documents([text])
+                return embeddings[0]
+            except Exception as e:
+                print(f"Google embedding error: {e}")
+                raise
 
     def add_situations(self, situations_and_advice):
         """Add financial situations and their corresponding advice. Parameter is a list of tuples (situation, rec)"""
@@ -45,7 +80,7 @@ class FinancialSituationMemory:
         )
 
     def get_memories(self, current_situation, n_matches=1):
-        """Find matching recommendations using OpenAI embeddings"""
+        """Find matching recommendations using configured embeddings API"""
         query_embedding = self.get_embedding(current_situation)
 
         results = self.situation_collection.query(
@@ -68,8 +103,13 @@ class FinancialSituationMemory:
 
 
 if __name__ == "__main__":
-    # Example usage
-    matcher = FinancialSituationMemory()
+    # Example usage with Google API
+    config = {
+        "backend_url": "https://generativeai.googleapis.com/",  # or your Google config
+        
+    }
+    
+    matcher = FinancialSituationMemory("test", config)
 
     # Example data
     example_data = [
