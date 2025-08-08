@@ -6,7 +6,7 @@ Fixes:
 2. yfinance column handling
 3. Integrated mock (no separate file needed)
 """
-
+import traceback
 import os
 import json
 import csv
@@ -88,48 +88,38 @@ def generate_trade_dates(end: date, months_back: int = 6) -> List[date]:
 
 
 def get_close_price(ticker: str, trade_date: date) -> float:
-    """Fixed version handling yfinance changes."""
-    # Don't try to get prices for future dates
+    """Fetch the last available adjusted close price up to the given date."""
     if trade_date > date.today():
         raise RuntimeError(f"Cannot get price for future date {trade_date}")
 
-    # Download with suppress=True to avoid warnings
-    data = yf.download(
-        ticker,
-        start=trade_date - timedelta(days=5),  # Get a few days of data
+    # Create Ticker object
+    ticker_obj = yf.Ticker(ticker)
+
+    # Fetch a small date range around the target date
+    data = ticker_obj.history(
+        start=trade_date - timedelta(days=5),
         end=trade_date + timedelta(days=1),
-        progress=False,
-        auto_adjust=True,  # Explicitly set this
-        actions=False,
-        threads=False,
+        auto_adjust=True
     )
 
     if data.empty:
         raise RuntimeError(f"No price data for {ticker} around {trade_date}")
 
-    # Handle different column names
-    price_col = None
-    if "Adj Close" in data.columns:
-        price_col = "Adj Close"
-    elif "Close" in data.columns:
-        price_col = "Close"
-    else:
+    # Ensure we have the right price column
+    price_col = "Close" if "Close" in data.columns else "Adj Close"
+    if price_col not in data.columns:
         raise RuntimeError(f"No price column found. Columns: {data.columns.tolist()}")
 
-    # Get the last available price up to trade_date
-    available_data = data[data.index <= str(trade_date)]
-    if available_data.empty:
-        # If no data up to trade_date, get the first available after
-        return float(data[price_col].iloc[0])
+    # Filter to dates up to trade_date
+    available_data = data[data.index.date <= trade_date]
+
+    if not available_data.empty:
+        # Last available price before or on trade_date
+        return float(available_data[price_col].iloc[-1])
     else:
-        # Fix the deprecation warning
-        price_series = available_data[price_col]
-        if not price_series.empty:
-            return float(price_series.iat[-1])
-        else:
-            return float('nan')
-
-
+        # If no earlier data, return the earliest available after
+        return float(data[price_col].iloc[0])
+    
 def safe_mkdir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
@@ -203,6 +193,7 @@ class Backtester:
             final_state, decision = self.graph.propagate(self.ticker, trade_date)
         except Exception as e:
             print(f"❌ {trade_date}: propagate error → {e}")
+            traceback.print_exc()
             return
 
         try:
@@ -364,9 +355,9 @@ class Backtester:
 ###############################################################################
 if __name__ == "__main__":
     # Configuration
-    TICKER = "SMCI"
+    TICKER = "HPE"
     END_DATE = date.today()  # This will be today 
-    MONTHS_BACK = 12
+    MONTHS_BACK = 6
 
     print(f"{'='*60}")
     print(f" BACKTESTING: {TICKER} ".center(60, "="))
@@ -391,10 +382,12 @@ if __name__ == "__main__":
     else:
         # Real agent configuration - YOUR CONFIG
         custom_cfg = {
-            "llm_provider": "google",
-            "backend_url": "https://generativelanguage.googleapis.com/v1",
-            "deep_think_llm": "gemini-2.5-flash-lite",
-            "quick_think_llm": "gemini-2.0-flash",
+            # "llm_provider": "google",
+            # "backend_url": "https://generativelanguage.googleapis.com/v1",
+            # "deep_think_llm": "gemini-2.5-flash-lite",
+            # "quick_think_llm": "gemini-2.0-flash",
+            "deep_think_llm": "gpt-5",
+            "quick_think_llm": "gpt-5-mini",
             "max_debate_rounds": 1,
             "online_tools": True,  # Set to False for faster testing
         }

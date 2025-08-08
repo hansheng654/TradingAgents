@@ -15,6 +15,46 @@ from tqdm import tqdm
 import yfinance as yf
 from openai import OpenAI
 from .config import get_config, set_config, DATA_DIR
+import httpx
+
+def create_openai_client_with_custom_retry():
+    """Create OpenAI client with enhanced retry configuration"""
+    config = get_config()
+    
+    # Custom HTTP client with longer timeouts and retry behavior
+    http_client = httpx.Client(
+        timeout=httpx.Timeout(
+            connect=30.0,   # 30 seconds to connect
+            read=180.0,     # 3 minutes to read response  
+            write=60.0,     # 1 minute to write request
+            pool=120.0      # 2 minutes for connection pooling
+        ),
+        limits=httpx.Limits(
+            max_connections=10,
+            max_keepalive_connections=5
+        )
+    )
+    
+    return OpenAI(
+        base_url=config["openai_url"],
+        max_retries=8,          # Increase retries from 3 to 8
+        timeout=180.0,          # 3 minute overall timeout
+        http_client=http_client # Use our custom HTTP settings
+    )
+
+# Helper to extract text from OpenAI Responses API output
+def _extract_text(resp):
+    # Prefer SDK convenience if available
+    if hasattr(resp, "output_text") and resp.output_text:
+        return resp.output_text
+    # Fallback: scan output items for first message text
+    for item in getattr(resp, "output", []) or []:
+        if getattr(item, "type", None) == "message":
+            for part in getattr(item, "content", []) or []:
+                txt = getattr(part, "text", None)
+                if txt:
+                    return txt
+    return ""
 
 
 def get_finnhub_news(
@@ -705,214 +745,178 @@ def get_YFin_data(
 
 def get_stock_news_openai(ticker, curr_date):
     config = get_config()
-    client = OpenAI(base_url=config["openai_url"])
+    client = create_openai_client_with_custom_retry()  # keep proxy/base_url behavior
 
     curr_dt_obj = datetime.strptime(curr_date, "%Y-%m-%d")
     start_date = (curr_dt_obj - timedelta(days=14)).strftime("%Y-%m-%d")
     end_date = curr_date  # already a string
-    prompt = f"""
-    You are a news aggregator. Provide only factual information without analysis or interpretation.
-    Search and List all news and events for {ticker} from {start_date} to {end_date} and only those dates.
-        Include:
-        - Company announcements
-        - Earnings reports
-        - Product launches
-        - Partnership news
-        - Management changes
-        - Analyst rating changes
-        - Price target updates
-        - Any other material events
 
-        For each item, provide:
-        - Date
-        - Source (if available)
-        - Brief factual summary
+    instructions = (
+        "You are a news aggregator. Provide only factual information without analysis or interpretation."
+    )
 
-        Just provide the raw information, no analysis or opinions."""
+    user_prompt = f"""
+Search and list all news and events for {ticker} from {start_date} to {end_date} and only those dates.
+Include:
+- Company announcements
+- Earnings reports
+- Product launches
+- Partnership news
+- Management changes
+- Analyst rating changes
+- Price target updates
+- Any other material events
+
+For each item, provide:
+- Date
+- Source (if available)
+- Brief factual summary
+
+Just provide the raw information, no analysis or opinions.
+""".strip()
+
     response = client.responses.create(
         model=config["openai_model"],
-        input=[
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": prompt,
-                    }
-                ],
-            }
-        ],
-        text={"format": {"type": "text"}},
-        reasoning={},
-        tools=[
-            {
-                "type": "web_search_preview",
-                "user_location": {"type": "approximate"},
-                "search_context_size": "high",
-            }
-        ],
-        temperature=0.5,
+        instructions=instructions,
+        input=[{"role": "user", "content": user_prompt}],
+        tools=[{"type": "web_search_preview", "search_context_size": "medium"}],
         max_output_tokens=4096,
         top_p=1,
         store=True,
     )
 
-    return response.output[1].content[0].text
+    return _extract_text(response)
 
 
 def get_global_news_openai(curr_date):
     config = get_config()
-    client = OpenAI(base_url=config["openai_url"])
+    client = create_openai_client_with_custom_retry() # keep proxy/base_url behavior
     curr_dt_obj = datetime.strptime(curr_date, "%Y-%m-%d")
     start_date = (curr_dt_obj - timedelta(days=14)).strftime("%Y-%m-%d")
-    prompt = f"""
-    You are a news aggregator. Provide only factual information without analysis or interpretation.
-    List all major global economic news from {start_date} to {curr_date}.
-    Include:
-    - Central bank decisions
-    - Economic data releases (GDP, CPI, employment)
-    - Government policy changes
-    - Geopolitical events affecting markets
-    - Major market movements
-    - Commodity price changes
 
-    For each item, provide:
-    - Date
-    - Event/headline
-    - Key numbers or facts
+    instructions = (
+        "You are a news aggregator. Provide only factual information without analysis or interpretation."
+    )
 
-    Just provide the raw information, no analysis or commentary."""
+    user_prompt = f"""
+List all major global economic news from {start_date} to {curr_date}.
+Include:
+- Central bank decisions
+- Economic data releases (GDP, CPI, employment)
+- Government policy changes
+- Geopolitical events affecting markets
+- Major market movements
+- Commodity price changes
+
+For each item, provide:
+- Date
+- Event/headline
+- Key numbers or facts
+
+Just provide the raw information, no analysis or commentary.
+""".strip()
+
     response = client.responses.create(
         model=config["openai_model"],
-        input=[
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": prompt,
-                    }
-                ],
-            }
-        ],
-        text={"format": {"type": "text"}},
-        reasoning={},
-        tools=[
-            {
-                "type": "web_search_preview",
-                "user_location": {"type": "approximate"},
-                "search_context_size": "high",
-            }
-        ],
-        temperature=0.5,
+        instructions=instructions,
+        input=[{"role": "user", "content": user_prompt}],
+        tools=[{"type": "web_search_preview", "search_context_size": "medium"}],        
         max_output_tokens=4096,
         top_p=1,
         store=True,
     )
 
-    return response.output[1].content[0].text
+    return _extract_text(response)
 
 
 def get_fundamentals_openai(ticker, curr_date):
     config = get_config()
-    client = OpenAI(base_url=config["openai_url"])
-    curr_dt_obj = datetime.strptime(curr_date, "%Y-%m-%d")
+    client = create_openai_client_with_custom_retry() 
+
+    instructions = f"""
+You are a meticulous FINANCIAL-DATA ASSISTANT.
+TASK
+-----
+For the equity ticker **{ticker}**, find the most up-to-date fundamental metrics available on or before {curr_date} using search tools:
+• P/E ratio
+• P/S ratio
+• P/B ratio
+• EV/EBITDA
+• PEG ratio
+• Market Cap
+• Revenue (TTM)
+• Net Income (TTM)
+• Gross Margin
+• Operating Margin
+• ROE
+• ROA
+• Debt/Equity
+• Current Ratio
+• Free Cash Flow (TTM)
+
+GUIDANCE FOR EACH METRIC
+-------------------------
+• **P/E ratio** — Price divided by trailing 12-month diluted EPS. Use split-adjusted price. Avoid forward estimates unless clearly marked.
+
+• **P/S ratio** — Market cap divided by TTM revenue. Double-check that revenue figure is *TTM*, not quarterly.
+
+• **P/B ratio** — Market cap divided by total shareholder equity. Use most recent *balance sheet*, not outdated summaries.
+
+• **EV/EBITDA** — Enterprise value divided by TTM EBITDA. Use filings or terminals for accurate EV and EBITDA reconciliation. Avoid EV/EBITDA derived from forward estimates.
+
+• **PEG ratio** — P/E divided by forward earnings growth rate. Accept only when the growth rate is sourced from analyst consensus (e.g., FactSet, Bloomberg). Avoid back-calculated or assumed growth.
+
+• **Market Cap** — Share price × total diluted shares outstanding. Ensure price is from reporting date and share count includes latest dilutions.
+
+• **Revenue (TTM)** — Total revenue for the trailing 12 months. Extract directly from filings. Avoid using latest quarter × 4.
+
+• **Net Income (TTM)** — Total net profit over the trailing 12 months. Validate it is after taxes/interest and matches official filings.
+
+• **Gross Margin** — Gross profit ÷ revenue. Use GAAP figures unless clearly labeled otherwise.
+
+• **Operating Margin** — Operating income ÷ revenue. Use GAAP operating income (not EBITDA).
+
+• **ROE** — Net income ÷ average shareholder equity (use TTM net income; average of beginning + ending equity).
+
+• **ROA** — Net income ÷ average total assets.
+
+• **Debt/Equity** — Total liabilities (or interest-bearing debt) ÷ equity. Clarify which is used.
+
+• **Current Ratio** — Current assets ÷ current liabilities. Use most recent quarter’s balance sheet.
+
+• **Free Cash Flow (TTM)** — CFO minus capex. Prefer GAAP-compliant cash flow statement figures.
+
+SOURCES (priority)
+------------------
+1. Company filings (10-Q, 10-K, annual/quarterly reports)
+2. Regulatory databases (SEC EDGAR, SEDAR+, ASX Announcements, etc.)
+3. Reputable aggregators (Bloomberg, Refinitiv, FactSet, S&P Capital IQ, Morningstar, Yahoo Finance, Macrotrends, Gurufocus)
+4. Mainstream financial press (WSJ, FT, CNBC, Reuters) only when explicitly quoting disclosures.
+
+If the exact reporting date isn’t available, use the nearest preceding quarter or fiscal year and cite the date of the report.
+
+OUTPUT FORMAT
+-------------
+Return one line per metric in plain English using this format:
+Metric: value — [source], [reporting period] – data accuracy: high|medium|low
+
+If a metric cannot be located with reasonable effort, write:
+Metric: N/A — [brief explanation] – data accuracy: low
+
+Be concise; list only the 14 requested metrics, nothing else.
+""".strip()
+
+    # Minimal user input; instruction holds the spec
+    user_prompt = "Return only the 14 requested lines."
+
     response = client.responses.create(
         model=config["openai_model"],
-        input=[
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": f"""
-                        You are a meticulous FINANCIAL-DATA ASSISTANT.
-                                TASK
-                                -----
-                                For the equity ticker **{ticker}**, find the most up-to-date fundamental metrics available on or before {curr_date} use search tools:
-                                • P/E ratio
-                                • P/S ratio
-                                • P/B ratio
-                                • EV/EBITDA
-                                • PEG ratio
-                                • Market Cap
-                                • Revenue (TTM)
-                                • Net Income (TTM)
-                                • Gross Margin
-                                • Operating Margin
-                                • ROE
-                                • ROA
-                                • Debt/Equity
-                                • Current Ratio
-                                • Free Cash Flow (TTM)
-
-                                GUIDANCE FOR EACH METRIC
-                                -------------------------
-                                • **P/E ratio** — Price divided by trailing 12-month diluted EPS. Use split-adjusted price. Avoid forward estimates unless clearly marked.
-
-                                • **P/S ratio** — Market cap divided by TTM revenue. Double-check that revenue figure is *TTM*, not quarterly.
-
-                                • **P/B ratio** — Market cap divided by total shareholder equity. Use most recent *balance sheet*, not outdated summaries.
-
-                                • **EV/EBITDA** — Enterprise value divided by TTM EBITDA. Use filings or terminals like Bloomberg for accurate EV and EBITDA reconciliation. Avoid EV/EBITDA derived from forward estimates.
-
-                                • **PEG ratio** — P/E divided by forward earnings growth rate. Accept only when the growth rate is sourced from analyst consensus (e.g. FactSet, Bloomberg). Avoid back-calculated or assumed growth.
-
-                                • **Market Cap** — Share price × total diluted shares outstanding. Ensure price is from reporting date and share count includes latest dilutions.
-
-                                • **Revenue (TTM)** — Total revenue for the trailing 12 months. Extract directly from 10-K or 10-Q filings. Avoid using just latest quarter × 4.
-
-                                • **Net Income (TTM)** — Total net profit over the trailing 12 months. Validate it is *after taxes and interest*, and matches official filings.
-
-                                • **Gross Margin** — Gross profit ÷ revenue. Find this in the income statement. Avoid quoting non-GAAP adjusted margins unless clearly labelled.
-
-                                • **Operating Margin** — Operating income ÷ revenue. Use GAAP operating income (not EBITDA). Avoid pro forma adjustments.
-
-                                • **ROE** — Net income ÷ average shareholder equity. Use TTM net income and average of beginning + ending equity.
-
-                                • **ROA** — Net income ÷ average total assets. Same method as ROE, with total assets.
-
-                                • **Debt/Equity** — Total liabilities (or just interest-bearing debt) ÷ equity. Clarify which version is used.
-
-                                • **Current Ratio** — Current assets ÷ current liabilities. Use most recent quarter’s balance sheet.
-
-                                • **Free Cash Flow (TTM)** — Cash flow from operations minus capex. Prefer GAAP-compliant figures from cash flow statement. Avoid "levered FCF" unless clearly labeled.
-
-                                SOURCES
-                                -------
-                                Prioritise in this order, but widen the search if needed:
-                                1. Company filings (10-Q, 10-K, Annual/Quarterly reports, prospectuses)
-                                2. Regulatory databases (SEC EDGAR, SEDAR+, ASX Announcements, Companies House, etc.)
-                                3. Reputable aggregators (Bloomberg, Refinitiv, FactSet, S&P Capital IQ, Morningstar, Yahoo Finance, Google Finance, Macrotrends, Gurufocus)
-                                4. Mainstream financial press (WSJ, FT, CNBC, Reuters) only when the figure is explicitly quoted from company disclosures.
-
-                                If the exact reporting date isn’t available, use the nearest preceding quarter or fiscal year and cite the date of the report.
-
-                                OUTPUT FORMAT
-                                -------------
-                                Return one line per metric in plain English using this format:
-                                Metric: value   — [source], [reporting period] – data accuracy: high|medium|low
-
-                                If a metric cannot be located with reasonable effort, write:
-                                Metric: N/A   — [brief explanation] – data accuracy: low
-
-                                Be concise; list only the 14 requested metrics, nothing else.
-                        """,
-                    }
-                ],
-            }
-        ],
-        text={"format": {"type": "text"}},
-        tools=[
-            {
-                "type": "web_search_preview",
-                "user_location": {"type": "approximate"},
-                "search_context_size": "high",
-            }
-        ],
-        temperature=0.7,
+        instructions=instructions,
+        input=[{"role": "user", "content": user_prompt}],
+        tools=[{"type": "web_search_preview", "search_context_size": "high"}],
         top_p=1.0,
         max_output_tokens=2048,
         store=True,
     )
-    return response.output[1].content[0].text
+
+    return _extract_text(response)

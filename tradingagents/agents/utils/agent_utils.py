@@ -13,6 +13,39 @@ from langchain_openai import ChatOpenAI
 import tradingagents.dataflows.interface as interface
 from tradingagents.default_config import DEFAULT_CONFIG
 from langchain_core.messages import HumanMessage
+import traceback
+import logging
+
+# Configure logging for debugging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def handle_tool_error(func_name: str, error: Exception, **kwargs) -> str:
+    """
+    Centralized error handling for toolkit functions
+    Prints to CLI and returns formatted error message
+    """
+    error_msg = f"ERROR in {func_name}: {str(error)}"
+    full_error = f"""
+================================================================================
+TOOLKIT ERROR in {func_name}
+================================================================================
+Parameters: {kwargs}
+Error Type: {type(error).__name__}
+Error Message: {str(error)}
+Traceback:
+{traceback.format_exc()}
+================================================================================
+"""
+    
+    # Print to CLI for immediate visibility
+    print(full_error)
+    
+    # Also log it
+    logger.error(full_error)
+    
+    # Return a structured error message for the calling system
+    return f"TOOL_ERROR: {func_name} failed - {str(error)}. Check CLI output for full details."
 
 
 def create_msg_delete():
@@ -60,10 +93,13 @@ class Toolkit:
         Returns:
             str: A formatted dataframe containing the latest global news from Reddit in the specified time frame.
         """
-        
-        global_news_result = interface.get_reddit_global_news(curr_date, 7, 5)
-
-        return global_news_result
+        try:
+            print(f"[TOOLKIT] Fetching Reddit news for {curr_date}")
+            global_news_result = interface.get_reddit_global_news(curr_date, 7, 5)
+            print(f"[TOOLKIT] Successfully retrieved Reddit news")
+            return global_news_result
+        except Exception as e:
+            return handle_tool_error("get_reddit_news", e, curr_date=curr_date)
 
     @staticmethod
     @tool
@@ -84,18 +120,21 @@ class Toolkit:
         Returns:
             str: A formatted dataframe containing news about the company within the date range from start_date to end_date
         """
+        try:
+            print(f"[TOOLKIT] Fetching Finnhub news for {ticker} from {start_date} to {end_date}")
+            
+            end_date_str = end_date
+            end_date = datetime.strptime(end_date, "%Y-%m-%d")
+            start_date = datetime.strptime(start_date, "%Y-%m-%d")
+            look_back_days = (end_date - start_date).days
 
-        end_date_str = end_date
-
-        end_date = datetime.strptime(end_date, "%Y-%m-%d")
-        start_date = datetime.strptime(start_date, "%Y-%m-%d")
-        look_back_days = (end_date - start_date).days
-
-        finnhub_news_result = interface.get_finnhub_news(
-            ticker, end_date_str, look_back_days
-        )
-
-        return finnhub_news_result
+            finnhub_news_result = interface.get_finnhub_news(
+                ticker, end_date_str, look_back_days
+            )
+            print(f"[TOOLKIT] Successfully retrieved Finnhub news for {ticker}")
+            return finnhub_news_result
+        except Exception as e:
+            return handle_tool_error("get_finnhub_news", e, ticker=ticker, start_date=start_date, end_date=end_date)
 
     @staticmethod
     @tool
@@ -114,10 +153,13 @@ class Toolkit:
         Returns:
             str: A formatted dataframe containing the latest news about the company on the given date
         """
-
-        stock_news_results = interface.get_reddit_company_news(ticker, curr_date, 7, 5)
-
-        return stock_news_results
+        try:
+            print(f"[TOOLKIT] Fetching Reddit stock info for {ticker} on {curr_date}")
+            stock_news_results = interface.get_reddit_company_news(ticker, curr_date, 7, 5)
+            print(f"[TOOLKIT] Successfully retrieved Reddit stock info for {ticker}")
+            return stock_news_results
+        except Exception as e:
+            return handle_tool_error("get_reddit_stock_info", e, ticker=ticker, curr_date=curr_date)
 
     @staticmethod
     @tool
@@ -135,10 +177,13 @@ class Toolkit:
         Returns:
             str: A formatted dataframe containing the stock price data for the specified ticker symbol in the specified date range.
         """
-
-        result_data = interface.get_YFin_data(symbol, start_date, end_date)
-
-        return result_data
+        try:
+            print(f"[TOOLKIT] Fetching Yahoo Finance data for {symbol} from {start_date} to {end_date}")
+            result_data = interface.get_YFin_data(symbol, start_date, end_date)
+            print(f"[TOOLKIT] Successfully retrieved Yahoo Finance data for {symbol}")
+            return result_data
+        except Exception as e:
+            return handle_tool_error("get_YFin_data", e, symbol=symbol, start_date=start_date, end_date=end_date)
 
     @staticmethod
     @tool
@@ -156,10 +201,13 @@ class Toolkit:
         Returns:
             str: A formatted dataframe containing the stock price data for the specified ticker symbol in the specified date range.
         """
-
-        result_data = interface.get_YFin_data_online(symbol, start_date, end_date)
-
-        return result_data
+        try:
+            print(f"[TOOLKIT] Fetching Yahoo Finance data ONLINE for {symbol} from {start_date} to {end_date}")
+            result_data = interface.get_YFin_data_online(symbol, start_date, end_date)
+            print(f"[TOOLKIT] Successfully retrieved Yahoo Finance data ONLINE for {symbol}")
+            return result_data
+        except Exception as e:
+            return handle_tool_error("get_YFin_data_online", e, symbol=symbol, start_date=start_date, end_date=end_date)
 
     @staticmethod
     @tool
@@ -183,12 +231,16 @@ class Toolkit:
         Returns:
             str: A formatted dataframe containing the stock stats indicators for the specified ticker symbol and indicator.
         """
-
-        result_stockstats = interface.get_stock_stats_indicators_window(
-            symbol, indicator, curr_date, look_back_days, False
-        )
-
-        return result_stockstats
+        try:
+            print(f"[TOOLKIT] Fetching stock stats indicators for {symbol}, indicator: {indicator}, date: {curr_date}")
+            result_stockstats = interface.get_stock_stats_indicators_window(
+                symbol, indicator, curr_date, look_back_days, False
+            )
+            print(f"[TOOLKIT] Successfully retrieved stock stats indicators for {symbol}")
+            return result_stockstats
+        except Exception as e:
+            return handle_tool_error("get_stockstats_indicators_report", e, 
+                                   symbol=symbol, indicator=indicator, curr_date=curr_date, look_back_days=look_back_days)
 
     @staticmethod
     @tool
@@ -212,12 +264,16 @@ class Toolkit:
         Returns:
             str: A formatted dataframe containing the stock stats indicators for the specified ticker symbol and indicator.
         """
-
-        result_stockstats = interface.get_stock_stats_indicators_window(
-            symbol, indicator, curr_date, look_back_days, True
-        )
-
-        return result_stockstats
+        try:
+            print(f"[TOOLKIT] Fetching stock stats indicators ONLINE for {symbol}, indicator: {indicator}, date: {curr_date}")
+            result_stockstats = interface.get_stock_stats_indicators_window(
+                symbol, indicator, curr_date, look_back_days, True
+            )
+            print(f"[TOOLKIT] Successfully retrieved stock stats indicators ONLINE for {symbol}")
+            return result_stockstats
+        except Exception as e:
+            return handle_tool_error("get_stockstats_indicators_report_online", e, 
+                                   symbol=symbol, indicator=indicator, curr_date=curr_date, look_back_days=look_back_days)
 
     @staticmethod
     @tool
@@ -236,12 +292,15 @@ class Toolkit:
         Returns:
             str: a report of the sentiment in the past 30 days starting at curr_date
         """
-
-        data_sentiment = interface.get_finnhub_company_insider_sentiment(
-            ticker, curr_date, 30
-        )
-
-        return data_sentiment
+        try:
+            print(f"[TOOLKIT] Fetching Finnhub insider sentiment for {ticker} on {curr_date}")
+            data_sentiment = interface.get_finnhub_company_insider_sentiment(
+                ticker, curr_date, 30
+            )
+            print(f"[TOOLKIT] Successfully retrieved Finnhub insider sentiment for {ticker}")
+            return data_sentiment
+        except Exception as e:
+            return handle_tool_error("get_finnhub_company_insider_sentiment", e, ticker=ticker, curr_date=curr_date)
 
     @staticmethod
     @tool
@@ -260,12 +319,15 @@ class Toolkit:
         Returns:
             str: a report of the company's insider transactions/trading information in the past 30 days
         """
-
-        data_trans = interface.get_finnhub_company_insider_transactions(
-            ticker, curr_date, 30
-        )
-
-        return data_trans
+        try:
+            print(f"[TOOLKIT] Fetching Finnhub insider transactions for {ticker} on {curr_date}")
+            data_trans = interface.get_finnhub_company_insider_transactions(
+                ticker, curr_date, 30
+            )
+            print(f"[TOOLKIT] Successfully retrieved Finnhub insider transactions for {ticker}")
+            return data_trans
+        except Exception as e:
+            return handle_tool_error("get_finnhub_company_insider_transactions", e, ticker=ticker, curr_date=curr_date)
 
     @staticmethod
     @tool
@@ -286,10 +348,13 @@ class Toolkit:
         Returns:
             str: a report of the company's most recent balance sheet
         """
-
-        data_balance_sheet = interface.get_simfin_balance_sheet(ticker, freq, curr_date)
-
-        return data_balance_sheet
+        try:
+            print(f"[TOOLKIT] Fetching SimFin balance sheet for {ticker}, frequency: {freq}, date: {curr_date}")
+            data_balance_sheet = interface.get_simfin_balance_sheet(ticker, freq, curr_date)
+            print(f"[TOOLKIT] Successfully retrieved SimFin balance sheet for {ticker}")
+            return data_balance_sheet
+        except Exception as e:
+            return handle_tool_error("get_simfin_balance_sheet", e, ticker=ticker, freq=freq, curr_date=curr_date)
 
     @staticmethod
     @tool
@@ -310,10 +375,13 @@ class Toolkit:
         Returns:
                 str: a report of the company's most recent cash flow statement
         """
-
-        data_cashflow = interface.get_simfin_cashflow(ticker, freq, curr_date)
-
-        return data_cashflow
+        try:
+            print(f"[TOOLKIT] Fetching SimFin cash flow for {ticker}, frequency: {freq}, date: {curr_date}")
+            data_cashflow = interface.get_simfin_cashflow(ticker, freq, curr_date)
+            print(f"[TOOLKIT] Successfully retrieved SimFin cash flow for {ticker}")
+            return data_cashflow
+        except Exception as e:
+            return handle_tool_error("get_simfin_cashflow", e, ticker=ticker, freq=freq, curr_date=curr_date)
 
     @staticmethod
     @tool
@@ -334,12 +402,15 @@ class Toolkit:
         Returns:
                 str: a report of the company's most recent income statement
         """
-
-        data_income_stmt = interface.get_simfin_income_statements(
-            ticker, freq, curr_date
-        )
-
-        return data_income_stmt
+        try:
+            print(f"[TOOLKIT] Fetching SimFin income statement for {ticker}, frequency: {freq}, date: {curr_date}")
+            data_income_stmt = interface.get_simfin_income_statements(
+                ticker, freq, curr_date
+            )
+            print(f"[TOOLKIT] Successfully retrieved SimFin income statement for {ticker}")
+            return data_income_stmt
+        except Exception as e:
+            return handle_tool_error("get_simfin_income_stmt", e, ticker=ticker, freq=freq, curr_date=curr_date)
 
     @staticmethod
     @tool
@@ -356,10 +427,13 @@ class Toolkit:
         Returns:
             str: A formatted string containing the latest news from Google News based on the query and date range.
         """
-
-        google_news_results = interface.get_google_news(query, curr_date, 7)
-
-        return google_news_results
+        try:
+            print(f"[TOOLKIT] Fetching Google News for query: '{query}' on {curr_date}")
+            google_news_results = interface.get_google_news(query, curr_date, 7)
+            print(f"[TOOLKIT] Successfully retrieved Google News for query: '{query}'")
+            return google_news_results
+        except Exception as e:
+            return handle_tool_error("get_google_news", e, query=query, curr_date=curr_date)
 
     @staticmethod
     @tool
@@ -375,10 +449,13 @@ class Toolkit:
         Returns:
             str: A formatted string containing the latest news about the company on the given date.
         """
-
-        openai_news_results = interface.get_stock_news_openai(ticker, curr_date)
-
-        return openai_news_results
+        try:
+            print(f"[TOOLKIT] Fetching OpenAI stock news for {ticker} on {curr_date}")
+            openai_news_results = interface.get_stock_news_openai(ticker, curr_date)
+            print(f"[TOOLKIT] Successfully retrieved OpenAI stock news for {ticker}")
+            return openai_news_results
+        except Exception as e:
+            return handle_tool_error("get_stock_news_openai", e, ticker=ticker, curr_date=curr_date)
 
     @staticmethod
     @tool
@@ -392,10 +469,13 @@ class Toolkit:
         Returns:
             str: A formatted string containing the latest macroeconomic news on the given date.
         """
-
-        openai_news_results = interface.get_global_news_openai(curr_date)
-
-        return openai_news_results
+        try:
+            print(f"[TOOLKIT] Fetching OpenAI global news for {curr_date}")
+            openai_news_results = interface.get_global_news_openai(curr_date)
+            print(f"[TOOLKIT] Successfully retrieved OpenAI global news")
+            return openai_news_results
+        except Exception as e:
+            return handle_tool_error("get_global_news_openai", e, curr_date=curr_date)
 
     @staticmethod
     @tool
@@ -411,9 +491,12 @@ class Toolkit:
         Returns:
             str: A formatted string containing the latest fundamental information about the company on the given date.
         """
-
-        openai_fundamentals_results = interface.get_fundamentals_openai(
-            ticker, curr_date
-        )
-
-        return openai_fundamentals_results
+        try:
+            print(f"[TOOLKIT] Fetching OpenAI fundamentals for {ticker} on {curr_date}")
+            openai_fundamentals_results = interface.get_fundamentals_openai(
+                ticker, curr_date
+            )
+            print(f"[TOOLKIT] Successfully retrieved OpenAI fundamentals for {ticker}")
+            return openai_fundamentals_results
+        except Exception as e:
+            return handle_tool_error("get_fundamentals_openai", e, ticker=ticker, curr_date=curr_date)

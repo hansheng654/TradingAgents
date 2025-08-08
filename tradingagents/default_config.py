@@ -11,9 +11,9 @@ DEFAULT_CONFIG = {
     # LLM settings
     "llm_provider": "openai",
     "openai_url": "https://api.openai.com/v1",
-    "openai_model": "gpt-4o",
-    "deep_think_llm": "o4-mini",
-    "quick_think_llm": "gpt-4o-mini",
+    "openai_model": "gpt-5",
+    "deep_think_llm": "gpt-5",
+    "quick_think_llm": "gpt-5-mini",
     "backend_url": "https://api.openai.com/v1",
     # Debate and discussion settings
     "max_debate_rounds": 1,
