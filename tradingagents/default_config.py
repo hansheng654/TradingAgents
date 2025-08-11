@@ -11,7 +11,7 @@ DEFAULT_CONFIG = {
     # LLM settings
     "llm_provider": "openai",
     "openai_url": "https://api.openai.com/v1",
-    "openai_model": "gpt-5",
+    "openai_model": "gpt-4o-mini",
     "deep_think_llm": "gpt-5",
     "quick_think_llm": "gpt-5-mini",
     "backend_url": "https://api.openai.com/v1",

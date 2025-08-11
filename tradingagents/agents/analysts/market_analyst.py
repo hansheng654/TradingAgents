@@ -13,11 +13,15 @@ def create_market_analyst(llm, toolkit):
         if toolkit.config["online_tools"]:
             tools = [
                 toolkit.get_YFin_data_online,
+                # Prefer batch to collapse multiple indicator calls into a single tool call
+                toolkit.get_stockstats_multi_indicators_report_online,
+                # Keep single-indicator as a fallback (e.g., if exactly one indicator is needed)
                 toolkit.get_stockstats_indicators_report_online,
             ]
         else:
             tools = [
                 toolkit.get_YFin_data,
+                # (No offline batch tool) keep single-indicator only
                 toolkit.get_stockstats_indicators_report,
             ]
 
@@ -48,6 +52,7 @@ Volume-Based Indicators:
 
 - Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both rsi and stochrsi). Also briefly explain why they are suitable for the given market context. When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Please make sure to call get_YFin_data first to retrieve the CSV that is needed to generate indicators. Write a very detailed and nuanced report of the trends you observe. Do not simply state the trends are mixed, provide detailed and finegrained analysis and insights that may help traders make decisions."""
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
+            + """When you need multiple indicators, prefer calling get_stockstats_multi_indicators_report_online once with a list of indicators (after fetching price data), rather than calling the single-indicator tool many times."""
         )
 
         prompt = ChatPromptTemplate.from_messages(
@@ -80,7 +85,7 @@ Volume-Based Indicators:
 
         if len(result.tool_calls) == 0:
             report = result.content
-       
+
         return {
             "messages": [result],
             "market_report": report,

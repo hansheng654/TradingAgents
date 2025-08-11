@@ -1,3 +1,5 @@
+ # lightweight per-process cache for batch indicator calls (avoids duplicate work in a run)
+_batch_indicators_cache: dict[tuple[str, str, int, tuple[str, ...]], str] = {}
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage, AIMessage
 from typing import List
 from typing import Annotated
@@ -274,6 +276,51 @@ class Toolkit:
         except Exception as e:
             return handle_tool_error("get_stockstats_indicators_report_online", e, 
                                    symbol=symbol, indicator=indicator, curr_date=curr_date, look_back_days=look_back_days)
+
+    @staticmethod
+    @tool
+    def get_stockstats_multi_indicators_report_online(
+        symbol: Annotated[str, "ticker symbol of the company"],
+        indicators: Annotated[list[str], "technical indicators to compute (e.g., ['rsi','macd','close_50_sma'])"],
+        curr_date: Annotated[str, "The current trading date you are trading on, YYYY-mm-dd"],
+        look_back_days: Annotated[int, "how many days to look back"] = 30,
+    ) -> str:
+        """
+        Retrieve **multiple** stock stats indicators for a given ticker in **one** tool call.
+        Internally loops over the existing single-indicator interface to avoid new dependencies.
+        Returns a combined, human-readable report.
+        """
+        try:
+            # normalize & cache key
+            norm_inds = tuple(sorted([i.strip() for i in indicators if i and isinstance(i, str)]))
+            cache_key = (symbol.upper().strip(), curr_date, int(look_back_days), norm_inds)
+            if cache_key in _batch_indicators_cache:
+                print(f"[TOOLKIT][CACHE HIT] Stock stats (BATCH) ONLINE for {symbol}, {len(norm_inds)} indicators, date: {curr_date}")
+                return _batch_indicators_cache[cache_key]
+
+            print(f"[TOOLKIT] Fetching stock stats (BATCH) ONLINE for {symbol}, {len(norm_inds)} indicators, date: {curr_date}")
+            reports: list[str] = []
+            for ind in norm_inds:
+                try:
+                    r = interface.get_stock_stats_indicators_window(
+                        symbol, ind, curr_date, look_back_days, True
+                    )
+                except Exception as ie:
+                    r = handle_tool_error(
+                        "get_stockstats_multi_indicators_report_online/subcall",
+                        ie, symbol=symbol, indicator=ind, curr_date=curr_date, look_back_days=look_back_days,
+                    )
+                reports.append(str(r))
+
+            combined = "\n\n".join(reports)
+            print(f"[TOOLKIT] Successfully retrieved stock stats (BATCH) ONLINE for {symbol}")
+            _batch_indicators_cache[cache_key] = combined
+            return combined
+        except Exception as e:
+            return handle_tool_error(
+                "get_stockstats_multi_indicators_report_online", e,
+                symbol=symbol, indicators=indicators, curr_date=curr_date, look_back_days=look_back_days,
+            )
 
     @staticmethod
     @tool

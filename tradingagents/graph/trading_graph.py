@@ -22,11 +22,27 @@ from tradingagents.agents.utils.agent_states import (
 )
 from tradingagents.dataflows.interface import set_config
 
-from .conditional_logic import ConditionalLogic
-from .setup import GraphSetup
-from .propagation import Propagator
-from .reflection import Reflector
-from .signal_processing import SignalProcessor
+# Support running as a package module or as a standalone script
+try:
+    from .conditional_logic import ConditionalLogic  # package-relative
+    from .setup import GraphSetup
+    from .propagation import Propagator
+    from .reflection import Reflector
+    from .signal_processing import SignalProcessor
+except Exception:
+    try:
+        # absolute imports when executed directly
+        from tradingagents.graph.conditional_logic import ConditionalLogic
+        from tradingagents.graph.setup import GraphSetup
+        from tradingagents.graph.propagation import Propagator
+        from tradingagents.graph.reflection import Reflector
+        from tradingagents.graph.signal_processing import SignalProcessor
+    except Exception as e:
+        raise ImportError(
+            "Could not import graph components. Try running as a module: \n"
+            "    python -m tradingagents.graph.trading_graph\n"
+            "or ensure project root is on PYTHONPATH."
+        ) from e
 
 
 class TradingAgentsGraph:
@@ -72,12 +88,8 @@ class TradingAgentsGraph:
         
         self.toolkit = Toolkit(config=self.config)
 
-        # Initialize memories
-        self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
-        self.bear_memory = FinancialSituationMemory("bear_memory", self.config)
-        self.trader_memory = FinancialSituationMemory("trader_memory", self.config)
-        self.invest_judge_memory = FinancialSituationMemory("invest_judge_memory", self.config)
-        self.risk_manager_memory = FinancialSituationMemory("risk_manager_memory", self.config)
+        # Initialize a single shared memory for retrieval & reflections
+        self.shared_memory = FinancialSituationMemory("situations", self.config)
 
         # Create tool nodes
         self.tool_nodes = self._create_tool_nodes()
@@ -89,11 +101,7 @@ class TradingAgentsGraph:
             self.deep_thinking_llm,
             self.toolkit,
             self.tool_nodes,
-            self.bull_memory,
-            self.bear_memory,
-            self.trader_memory,
-            self.invest_judge_memory,
-            self.risk_manager_memory,
+            self.shared_memory,
             self.conditional_logic,
         )
 
@@ -114,7 +122,8 @@ class TradingAgentsGraph:
         return {
             "market": ToolNode(
                 [
-                    # online tools
+                    # online tools (batch first to encourage single-call usage)
+                    self.toolkit.get_stockstats_multi_indicators_report_online,
                     self.toolkit.get_YFin_data_online,
                     self.toolkit.get_stockstats_indicators_report_online,
                     # offline tools
@@ -191,34 +200,33 @@ class TradingAgentsGraph:
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""
+        inv = final_state.get("investment_debate_state", {})
+        risk = final_state.get("risk_debate_state", {})
+
         self.log_states_dict[str(trade_date)] = {
-            "company_of_interest": final_state["company_of_interest"],
-            "trade_date": final_state["trade_date"],
-            "market_report": final_state["market_report"],
-            "sentiment_report": final_state["sentiment_report"],
-            "news_report": final_state["news_report"],
-            "fundamentals_report": final_state["fundamentals_report"],
+            "company_of_interest": final_state.get("company_of_interest", self.ticker or ""),
+            "trade_date": final_state.get("trade_date", str(trade_date)),
+            "market_report": final_state.get("market_report", ""),
+            "sentiment_report": final_state.get("sentiment_report", ""),
+            "news_report": final_state.get("news_report", ""),
+            "fundamentals_report": final_state.get("fundamentals_report", ""),
             "investment_debate_state": {
-                "bull_history": final_state["investment_debate_state"]["bull_history"],
-                "bear_history": final_state["investment_debate_state"]["bear_history"],
-                "history": final_state["investment_debate_state"]["history"],
-                "current_response": final_state["investment_debate_state"][
-                    "current_response"
-                ],
-                "judge_decision": final_state["investment_debate_state"][
-                    "judge_decision"
-                ],
+                "bull_history": inv.get("bull_history", ""),
+                "bear_history": inv.get("bear_history", ""),
+                "history": inv.get("history", ""),
+                "current_response": inv.get("current_response", ""),
+                "judge_decision": inv.get("judge_decision", ""),
             },
-            "trader_investment_decision": final_state["trader_investment_plan"],
+            "trader_investment_decision": final_state.get("trader_investment_plan", ""),
             "risk_debate_state": {
-                "risky_history": final_state["risk_debate_state"]["risky_history"],
-                "safe_history": final_state["risk_debate_state"]["safe_history"],
-                "neutral_history": final_state["risk_debate_state"]["neutral_history"],
-                "history": final_state["risk_debate_state"]["history"],
-                "judge_decision": final_state["risk_debate_state"]["judge_decision"],
+                "risky_history": risk.get("risky_history", ""),
+                "safe_history": risk.get("safe_history", ""),
+                "neutral_history": risk.get("neutral_history", ""),
+                "history": risk.get("history", ""),
+                "judge_decision": risk.get("judge_decision", ""),
             },
-            "investment_plan": final_state["investment_plan"],
-            "final_trade_decision": final_state["final_trade_decision"],
+            "investment_plan": final_state.get("investment_plan", ""),
+            "final_trade_decision": final_state.get("final_trade_decision", ""),
         }
 
         # Save to file
@@ -232,23 +240,184 @@ class TradingAgentsGraph:
             json.dump(self.log_states_dict, f, indent=4)
 
     def reflect_and_remember(self, returns_losses):
-        """Reflect on decisions and update memory based on returns."""
+        """Reflect on decisions and update memory based on returns.
+        Uses the shared memory store for all roles to keep retrieval unified.
+        """
         self.reflector.reflect_bull_researcher(
-            self.curr_state, returns_losses, self.bull_memory
+            self.curr_state, returns_losses, self.shared_memory
         )
         self.reflector.reflect_bear_researcher(
-            self.curr_state, returns_losses, self.bear_memory
+            self.curr_state, returns_losses, self.shared_memory
         )
         self.reflector.reflect_trader(
-            self.curr_state, returns_losses, self.trader_memory
+            self.curr_state, returns_losses, self.shared_memory
         )
         self.reflector.reflect_invest_judge(
-            self.curr_state, returns_losses, self.invest_judge_memory
+            self.curr_state, returns_losses, self.shared_memory
         )
         self.reflector.reflect_risk_manager(
-            self.curr_state, returns_losses, self.risk_manager_memory
+            self.curr_state, returns_losses, self.shared_memory
         )
 
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""
         return self.signal_processor.process_signal(full_signal)
+
+
+# === Self-test harness for TradingAgentsGraph wiring ===
+if __name__ == "__main__":
+    """
+    Lightweight end-to-end self-test for TradingAgentsGraph wiring with the Memory Broker.
+    - Avoids any network/LLM/tool calls by monkeypatching dependencies to dummies.
+    - Verifies that analysts run, Memory Broker populates preview, and the flow reaches a final decision.
+
+    Run:
+        python tradingagents/graph/trading_graph.py
+    """
+    from types import SimpleNamespace
+    from datetime import datetime, timezone
+    import tradingagents.graph.setup as setup_mod
+
+    print("\n== TradingAgentsGraph wiring self-test ==\n")
+
+    # ---- Dummy LLM that matches Chat* constructors and captures prompts ----
+    class DummyLLM:
+        def __init__(self, model=None, base_url=None, **kwargs):
+            self.model = model
+            self.base_url = base_url
+            self.calls = 0
+            self.last_input = None
+        def invoke(self, x):
+            self.calls += 1
+            self.last_input = x
+            return SimpleNamespace(content="DUMMY: ok")
+
+    # Monkeypatch the LLM classes used in this module (so __init__ succeeds without network)
+    ChatOpenAI = DummyLLM          # type: ignore
+    ChatAnthropic = DummyLLM       # type: ignore
+    ChatGoogleGenerativeAI = DummyLLM  # type: ignore
+
+    # ---- Dummy Shared Memory so Memory Broker does not embed/call APIs ----
+    class DummySharedMemory:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+        def get_memories(self, current_situation, n_matches=2):
+            self.calls += 1
+            # Return two simple memories
+            return [
+                {
+                    "matched_situation": "Tech rotation with rising yields",
+                    "recommendation": "Reduce duration; prefer cash-flow positive leaders.",
+                    "similarity_score": 0.71,
+                },
+                {
+                    "matched_situation": "Earnings season defensives bid",
+                    "recommendation": "Increase staples/utilities; hedge beta.",
+                    "similarity_score": 0.53,
+                },
+            ][:n_matches]
+
+    # Patch the FinancialSituationMemory symbol in this module to our dummy
+    FinancialSituationMemory = DummySharedMemory  # type: ignore
+
+    # ---- Patch tool nodes to pure no-ops (no external calls) ----
+    def _noop_tool(state):
+        return {}
+    def _no_tool_nodes(self):
+        return {
+            "market": _noop_tool,
+            "social": _noop_tool,
+            "news": _noop_tool,
+            "fundamentals": _noop_tool,
+        }
+    TradingAgentsGraph._create_tool_nodes = _no_tool_nodes  # type: ignore
+
+    # ---- Control flow logic: always advance deterministically ----
+    class DummyConditionalLogic:
+        # Analysts: always choose 'clear' branch (advance)
+        def __getattr__(self, name):
+            if name.startswith("should_continue_"):
+                return lambda state: "clear"
+            raise AttributeError(name)
+        # Debate: jump to Research Manager immediately
+        def should_continue_debate(self, state):
+            return "Research Manager"
+        # Risk: jump to Risk Judge for final decision
+        def should_continue_risk_analysis(self, state):
+            return "Risk Judge"
+
+    # Patch ConditionalLogic used by this module
+    ConditionalLogic = DummyConditionalLogic  # type: ignore
+
+    # ---- Monkeypatch node factories inside setup module under test ----
+    def _mk_long_report(name, key):
+        def node(state):
+            filler = (
+                f" {name} context: RSI 65, MACD bullish, CPI 3.2% YoY, EPS +10%, "
+                f"tickers AAPL NVDA MSFT; liquidity ample; breadth improving."
+            ) * 60  # ensure Memory Broker triggers with production thresholds
+            return {key: f"{name} report OK at {datetime.now(timezone.utc).isoformat()}." + filler}
+        return node
+
+    def _mk_clear():
+        def node(state):
+            return {}
+        return node
+
+    def _mk_set(key, value):
+        def node(state):
+            return {key: value}
+        return node
+
+    # Analysts
+    setup_mod.create_market_analyst = lambda llm, tk: _mk_long_report("Market", "market_report")  # type: ignore
+    setup_mod.create_social_media_analyst = lambda llm, tk: _mk_long_report("Social", "sentiment_report")  # type: ignore
+    setup_mod.create_news_analyst = lambda llm, tk: _mk_long_report("News", "news_report")  # type: ignore
+    setup_mod.create_fundamentals_analyst = lambda llm, tk: _mk_long_report("Fundamentals", "fundamentals_report")  # type: ignore
+    setup_mod.create_msg_delete = lambda: _mk_clear()  # type: ignore
+
+    # Researchers & manager (minimal outputs)
+    setup_mod.create_bull_researcher = lambda llm, mem: _mk_set("investment_debate_state", {"bull_history": "BULL ok"})  # type: ignore
+    setup_mod.create_bear_researcher = lambda llm, mem: _mk_set("investment_debate_state", {"bear_history": "BEAR ok"})  # type: ignore
+    setup_mod.create_research_manager = lambda llm, mem: _mk_set("investment_plan", "RM: BUY with plan")  # type: ignore
+
+    # Trader
+    setup_mod.create_trader = lambda llm, mem: _mk_set("trader_investment_plan", "TRADER: BUY on signal")  # type: ignore
+
+    # Risk debators & judge; judge emits final decision
+    setup_mod.create_risky_debator = lambda llm: _mk_set("risk_debate_state", {"risky_history": "RISKY ok"})  # type: ignore
+    setup_mod.create_neutral_debator = lambda llm: _mk_set("risk_debate_state", {"neutral_history": "NEUTRAL ok"})  # type: ignore
+    setup_mod.create_safe_debator = lambda llm: _mk_set("risk_debate_state", {"safe_history": "SAFE ok"})  # type: ignore
+    setup_mod.create_risk_manager = lambda llm, mem: (  # type: ignore
+        _mk_set("final_trade_decision", "FINAL: BUY")
+    )
+
+    # ---- Build config (no real endpoints used) ----
+    cfg = DEFAULT_CONFIG.copy()
+    cfg["llm_provider"] = "openai"
+    cfg["backend_url"] = "http://localhost"
+    cfg["deep_think_llm"] = "dummy-deep"
+    cfg["quick_think_llm"] = "dummy-quick"
+    cfg["online_tools"] = False
+
+    # ---- Instantiate and run once ----
+    graph = TradingAgentsGraph(selected_analysts=["market", "news"], debug=False, config=cfg)
+    final_state, decision = graph.propagate("TEST", "2025-01-01")
+
+    # ---- Diagnostics ----
+    produced_keys = [k for k in final_state.keys() if k in (
+        "market_report","news_report","past_memories","past_memories_preview","past_memories_str",
+        "investment_plan","trader_investment_plan","risk_debate_state","final_trade_decision"
+    )]
+    print("Produced keys:", produced_keys)
+    print("past_memories count:", len(final_state.get("past_memories", [])))
+    print("preview len:", len((final_state.get("past_memories_preview") or "")))
+    print("final decision:", final_state.get("final_trade_decision"))
+
+    # ---- Assertions ----
+    assert "market_report" in final_state and "news_report" in final_state, "Analyst reports missing"
+    assert isinstance(final_state.get("past_memories"), list), "Memory Broker did not populate past_memories"
+    assert isinstance(final_state.get("past_memories_preview"), str), "No preview string from Memory Broker"
+    assert final_state.get("final_trade_decision") in ("FINAL: BUY", "BUY", "SELL", "HOLD"), "No final decision produced"
+
+    print("\nTradingAgentsGraph wiring self-test passed.\n")

@@ -56,6 +56,12 @@ USE_MOCK = False  # CHANGE THIS TO False TO USE REAL AGENT
 if not USE_MOCK:
     from tradingagents.graph.trading_graph import TradingAgentsGraph
     from tradingagents.default_config import DEFAULT_CONFIG
+    try:
+        # Optional: start each backtest run with a clean embedding cache
+        from tradingagents.agents.utils.memory import clear_embedding_cache
+        clear_embedding_cache()
+    except Exception:
+        pass
 else:
     TradingAgentsGraph = MockTradingAgentsGraph
     DEFAULT_CONFIG = {}
@@ -190,7 +196,8 @@ class Backtester:
             return
 
         try:
-            final_state, decision = self.graph.propagate(self.ticker, trade_date)
+            # Pass ISO string for date; TradingAgentsGraph expects a YYYY-MM-DD string
+            final_state, decision = self.graph.propagate(self.ticker, trade_date.isoformat())
         except Exception as e:
             print(f"❌ {trade_date}: propagate error → {e}")
             traceback.print_exc()
@@ -398,7 +405,7 @@ if __name__ == "__main__":
         start_cash=1_000.0,
         fee=1.0,
         config_overrides=custom_cfg,
-        debug=False,
+        debug=True,
     )
 
     # Run trades

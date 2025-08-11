@@ -1,4 +1,5 @@
-from typing import Annotated, Sequence
+from typing import Annotated, Sequence, List, Dict, Any
+import os
 from datetime import date, timedelta, datetime
 from typing_extensions import TypedDict, Optional
 from langchain_openai import ChatOpenAI
@@ -61,6 +62,15 @@ class AgentState(MessagesState):
     ]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
 
+    # OPTIMIZATION: Cached memories to avoid duplicate retrievals
+    past_memories: Annotated[
+        List[Dict[str, Any]], "Cached past memories for all agents to use"
+    ]
+    past_memories_preview: Annotated[
+        str, "LLM-compressed, token-bounded preview of past memories"
+    ]
+    past_memories_str: Annotated[str, "Formatted string of past memories"]
+
     # researcher team discussion step
     investment_debate_state: Annotated[
         InvestDebateState, "Current state of the debate on if to invest or not"
@@ -74,3 +84,342 @@ class AgentState(MessagesState):
         RiskDebateState, "Current state of the debate on evaluating risk"
     ]
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
+
+
+# Fallback preview builder (non-LLM)
+def _build_preview_fallback(
+    past_memories: List[Dict[str, Any]], max_items: int = 5, max_chars: int = 1200
+) -> str:
+    """
+    Fallback (non-LLM) preview: builds a compact, readable list with IDs.
+    Keeps full text in state['past_memories'] and only shows short snippets here.
+    """
+    if not past_memories:
+        return "No past memories found."
+    out = ["Past similar cases (preview):"]
+    total = 0
+    for i, rec in enumerate(past_memories[:max_items], 1):
+        txt = (rec.get("recommendation") or "").strip()
+        score = rec.get("similarity_score", None)
+        snip = txt[:240] + ("…" if len(txt) > 240 else "")
+        line = (
+            f"- ID={i} | score={score:.3f} | {snip}"
+            if isinstance(score, (int, float))
+            else f"- ID={i} | {snip}"
+        )
+        # stop if would exceed cap
+        if max_chars and total + len(line) + 1 > max_chars:
+            break
+        out.append(line)
+        total += len(line) + 1
+    return "\n".join(out) if len(out) > 1 else "No past memories found."
+
+
+# LLM-based summarizer for past memories
+def _summarize_past_memories_with_llm(
+    past_memories: List[Dict[str, Any]],
+    *,
+    max_tokens: int = 1024,
+    model: str = "gpt-5-mini",
+) -> Optional[str]:
+    """
+    Single LLM call that compresses K retrieved memories into a token-bounded bullet list.
+    Uses OpenAI via langchain_openai.ChatOpenAI if OPENAI_API_KEY is present.
+    Returns None if unavailable or on error.
+    """
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        llm = ChatOpenAI(
+            model=model, max_tokens=max_tokens, api_key=api_key
+        )
+        # Build a compact system+user prompt
+        items = []
+        for i, rec in enumerate(past_memories, 1):
+            scenario = (rec.get("matched_situation") or "").strip().replace("\n", " ")
+            recommendation = (
+                (rec.get("recommendation") or "").strip().replace("\n", " ")
+            )
+            # Build a safe score string
+            score_val = rec.get("similarity_score", None)
+            if isinstance(score_val, (int, float)):
+                score_str = f"{score_val:.3f}"
+            else:
+                try:
+                    # Handle cases where score is a string number
+                    score_str = f"{float(score_val):.3f}"
+                except (TypeError, ValueError):
+                    score_str = "NA"
+            items.append(
+                f"ID={i} | score={score_str} | scenario: {scenario} | action: {recommendation}"
+            )
+        joined = "\n".join(items[:10])  # hard cap to avoid giant prompts
+        system = (
+            f"You compress prior cases into an briefing for a trading debate.\n"
+            f"Output <= {max_tokens} tokens, bullet list. Keep IDs so agents can cross-reference.\n"
+            f"Each bullet MUST include: ID, score, 1-5 line scenario, 1-line action. Include constraints/numbers if present, and unsure options."
+        )
+        user = f"Cases:\n{joined}\n\nWrite the compressed bullets now."
+        resp = llm.invoke(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        )
+        text = resp.content if hasattr(resp, "content") else str(resp)
+        # basic sanity
+        text = (text or "").strip()
+        if not text:
+            return None
+        return text
+    except Exception as e:
+        print(f"[MEMORY BROKER] LLM summarization failed: {e}")
+        return None
+
+
+def create_memory_broker(
+    shared_memory,
+    *,
+    n_matches: int = 2,
+    min_chars: int = 400,
+    summary_max_tokens: int = 1024,
+    summary_model: str = "gpt-4o-mini",
+    temperature: float = 0.2,
+    preview_max_items: int = 5,
+    preview_max_chars: int = 2048,
+    llm_only_if_needed: bool = True,
+    preview_trigger_chars: int = 1200,
+):
+    """
+    Creates a memory broker node that fetches memories once after analyst reports are complete.
+    This avoids duplicate embedding and retrieval calls across all agents.
+    - Single shared memory instance across all agents.
+    - Idempotent: if memories already exist in state, returns without doing work.
+    - Resilient: catches memory lookup failures and falls back to empty.
+    - Compact: builds an LLM-compressed preview (single call per date); falls back to a deterministic preview if no API key.
+
+    Tunables:
+    - n_matches: number of nearest memories to fetch
+    - min_chars: minimum characters required in the current situation before querying memory
+    - summary_max_tokens, summary_model, temperature: controls for the LLM compression call
+    - preview_max_items, preview_max_chars: fallback preview sizing when LLM unavailable
+    - llm_only_if_needed: if True, skip LLM and use RAW concatenation when small enough
+    - preview_trigger_chars: max raw length (chars) before LLM summarization is triggered
+    """
+
+    def memory_broker_node(state) -> dict:
+        # If we already cached memories (or even just the string), do nothing (idempotent)
+        if state.get("past_memories") or state.get("past_memories_str"):
+            return {}
+
+        # Build the current situation from the four reports (only non-empty parts)
+        parts = []
+        market_report = (state.get("market_report") or "").strip()
+        sentiment_report = (state.get("sentiment_report") or "").strip()
+        news_report = (state.get("news_report") or "").strip()
+        fundamentals_report = (state.get("fundamentals_report") or "").strip()
+
+        if market_report:
+            parts.append(market_report)
+        if sentiment_report:
+            parts.append(sentiment_report)
+        if news_report:
+            parts.append(news_report)
+        if fundamentals_report:
+            parts.append(fundamentals_report)
+
+        if not parts:
+            # Analysts haven't produced anything yet
+            return {
+                "past_memories": [],
+                "past_memories_preview": "No past memories found.",
+                "past_memories_str": "No past memories found.",
+            }
+
+        curr_situation = "\n\n".join(parts)
+
+        # Guard against issuing queries for very small contexts
+        if min_chars and len(curr_situation) < min_chars:
+            print(
+                f"[MEMORY BROKER] Skipping memory query (situation too small: {len(curr_situation)} chars < {min_chars})"
+            )
+            return {
+                "past_memories": [],
+                "past_memories_preview": "No past memories found.",
+                "past_memories_str": "No past memories found.",
+            }
+
+        print("[MEMORY BROKER] Fetching memories once for all agents...")
+        try:
+            past_memories = shared_memory.get_memories(
+                curr_situation, n_matches=n_matches
+            )
+        except Exception as e:
+            print(f"[MEMORY BROKER] Memory lookup failed: {e}")
+            past_memories = []
+
+        # Compute diagnostics on original memory content
+        orig_total_chars = sum(len((rec.get("recommendation") or "")) for rec in past_memories)
+        raw_lines = []
+        for i, rec in enumerate(past_memories, 1):
+            rec_txt = (rec.get("recommendation") or "").strip().replace("\n", " ")
+            score_val = rec.get("similarity_score", None)
+            if isinstance(score_val, (int, float)):
+                score_str = f"{score_val:.3f}"
+            else:
+                try:
+                    score_str = f"{float(score_val):.3f}"
+                except (TypeError, ValueError):
+                    score_str = "NA"
+            raw_lines.append(f"- ID={i} | score={score_str} | {rec_txt}")
+        raw_concat = "\n".join(raw_lines)
+        raw_len = len(raw_concat)
+
+        # Decide preview strategy:
+        #  - If llm_only_if_needed=True and raw is short enough, use RAW (no LLM).
+        #  - Else attempt LLM summary, falling back to deterministic preview.
+        use_raw = llm_only_if_needed and raw_len <= max(preview_trigger_chars, 0)
+
+        if use_raw:
+            preview = raw_concat
+            source = "RAW"
+        else:
+            preview = _summarize_past_memories_with_llm(
+                past_memories,
+                max_tokens=summary_max_tokens,
+                model=summary_model,
+            )
+            source = "LLM" if preview is not None else "FALLBACK"
+            if preview is None:
+                preview = _build_preview_fallback(
+                    past_memories, max_items=preview_max_items, max_chars=preview_max_chars
+                )
+
+        print(
+            f"[MEMORY BROKER] Cached {len(past_memories)} memories; "
+            f"orig_total_chars={orig_total_chars}; raw_concat_len={raw_len}; "
+            f"preview_source={source}; preview_size={len(preview)} chars"
+        )
+
+        # Store in state for all agents to use; keep legacy field for compatibility
+        return {
+            "past_memories": past_memories,
+            "past_memories_preview": preview,
+            "past_memories_str": preview,
+        }
+
+    return memory_broker_node
+
+
+if __name__ == "__main__":
+    """
+    Lightweight self-tests for create_memory_broker when executed directly:
+    - Test 1: normal path builds situation, fetches n_matches, formats/caps string.
+    - Test 2: idempotency (second call should do nothing and not re-hit memory).
+    - Test 3: min_chars guard (skips lookup if situation too short).
+    """
+
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class DummySharedMemory:
+        calls: int = 0
+        last_query: str = ""
+        dataset: list = field(
+            default_factory=lambda: [
+                {"matched_situation": "Case A", "recommendation": "Rec A " + "x" * 200},
+                {"matched_situation": "Case B", "recommendation": "Rec B " + "y" * 200},
+                {"matched_situation": "Case C", "recommendation": "Rec C " + "z" * 200},
+            ]
+        )
+
+        def get_memories(self, current_situation, n_matches=2):
+            self.calls += 1
+            self.last_query = current_situation
+            return self.dataset[:n_matches]
+
+    def _print_state(label, s):
+        print(f"== {label} ==\n")
+        print("past_memories count:", len(s.get("past_memories", [])))
+        print("past_memories_str len:", len((s.get("past_memories_str") or "")))
+        print("past_memories_preview len:", len((s.get("past_memories_preview") or "")))
+        print("broker returned keys:", list(s.keys()))
+
+    # ---- Test 1: Normal path ----
+    shared = DummySharedMemory()
+    broker = create_memory_broker(
+        shared,
+        n_matches=2,
+        min_chars=50,
+        summary_max_tokens=200,
+        llm_only_if_needed=True,
+        preview_trigger_chars=800,  # small enough that two short recs should stay RAW in most cases
+    )
+
+    state = {
+        "market_report": "Market says uptrend continues. " * 3,
+        "sentiment_report": "Sentiment mixed but improving. " * 3,
+        "news_report": "Earnings season shows surprises. " * 3,
+        "fundamentals_report": "Margins stable with modest growth. " * 3,
+    }
+
+    out1 = broker(state)
+    _print_state("Test 1 (normal)", out1)
+    assert len(out1["past_memories"]) == 2, "Should fetch n_matches memories"
+    assert shared.calls == 1, "Memory should be queried exactly once"
+    assert (
+        isinstance(out1.get("past_memories_preview"), str)
+        and len(out1["past_memories_preview"]) > 0
+    ), "Preview should exist"
+    assert (
+        out1["past_memories_str"] == out1["past_memories_preview"]
+    ), "Legacy field should mirror preview"
+
+    # Merge back into state as graph would do
+    state.update(out1)
+
+    # ---- Test 1b: Force LLM path by lowering trigger threshold ----
+    state_llm = {
+        "market_report": state["market_report"],
+        "sentiment_report": state["sentiment_report"],
+        "news_report": state["news_report"],
+        "fundamentals_report": state["fundamentals_report"],
+    }
+    shared_llm = DummySharedMemory()
+    broker_llm = create_memory_broker(
+        shared_llm,
+        n_matches=2,
+        min_chars=50,
+        summary_max_tokens=200,
+        llm_only_if_needed=True,
+        preview_trigger_chars=10,  # force summarization even for tiny raw payloads
+    )
+    out1b = broker_llm(state_llm)
+    _print_state("Test 1b (forced LLM path)", out1b)
+    assert len(out1b["past_memories"]) == 2
+    assert shared_llm.calls == 1
+
+    # ---- Test 2: Idempotency (should not re-hit memory) ----
+    out2 = broker(state)
+    _print_state("Test 2 (idempotent)", out2)
+    assert out2 == {}, "Broker should be a no-op when memories already present"
+    assert shared.calls == 1, "Memory should not be hit again"
+
+    # ---- Test 3: min_chars guard (too short → skip) ----
+    state_small = {
+        "market_report": "short",
+        "sentiment_report": "",
+        "news_report": "",
+        "fundamentals_report": "",
+    }
+    shared2 = DummySharedMemory()
+    broker2 = create_memory_broker(
+        shared2, n_matches=2, min_chars=20, summary_max_tokens=200
+    )
+    out3 = broker2(state_small)
+    _print_state("Test 3 (min_chars guard)", out3)
+    assert out3["past_memories"] == [], "Should skip lookup and return empty memories"
+    assert (
+        "No past memories" in out3["past_memories_str"]
+    ), "Should set friendly message"
+    assert shared2.calls == 0, "Memory should not be hit for too-small situations"
+
+    print("\nAll create_memory_broker self-tests passed.")

@@ -35,3 +35,7 @@ dependencies = [
     "numpy (==1.26.4)",
     "tiktoken (>=0.10.0,<0.11.0)",
 ]
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^6.30.1"
+

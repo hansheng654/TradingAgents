@@ -1,4 +1,6 @@
 from typing import Annotated, Dict
+import time
+from pathlib import Path
 from datetime import datetime, timedelta
 from .reddit_utils import fetch_top_from_category
 from .yfin_utils import *
@@ -55,6 +57,49 @@ def _extract_text(resp):
                 if txt:
                     return txt
     return ""
+
+# --- simple disk cache helpers for Responses outputs ---
+_DEF_CACHE_ROOT = Path(DATA_DIR) / "openai_news_cache"
+
+_DEF_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+
+def _cache_read(rel_path: Path) -> str | None:
+    try:
+        p = _DEF_CACHE_ROOT / rel_path
+        if p.exists() and p.is_file():
+            return p.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    return None
+
+def _cache_write(rel_path: Path, text: str) -> None:
+    try:
+        p = _DEF_CACHE_ROOT / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+# --- naive retry with exponential backoff for Responses API ---
+_DEF_MAX_ATTEMPTS = 4
+_DEF_BASE_SLEEP = 1.5
+
+def _responses_with_retries(create_fn, *args, **kwargs):
+    attempts = 0
+    while True:
+        try:
+            return create_fn(*args, **kwargs)
+        except Exception as e:
+            attempts += 1
+            if attempts >= _DEF_MAX_ATTEMPTS:
+                raise
+            # Try to parse Retry-After if present on the exception text
+            msg = str(e)
+            wait = _DEF_BASE_SLEEP * (2 ** (attempts - 1))
+            # Best-effort surfacing
+            print(f"[INTERFACE][RETRY] {msg.strip()[:160]} … sleeping {wait:.2f}s (attempt {attempts}/{_DEF_MAX_ATTEMPTS})")
+            time.sleep(wait)
+            continue
 
 
 def get_finnhub_news(
@@ -460,6 +505,8 @@ def get_reddit_company_news(
     return f"##{ticker} News Reddit, from {before} to {curr_date}:\n\n{news_str}"
 
 
+#
+# See also: get_stock_stats_multi_indicators_window() for batch usage.
 def get_stock_stats_indicators_window(
     symbol: Annotated[str, "ticker symbol of the company"],
     indicator: Annotated[str, "technical indicator to get the analysis and report of"],
@@ -594,6 +641,35 @@ def get_stock_stats_indicators_window(
     )
 
     return result_str
+
+
+# Batch version: run window stats for a list of indicators
+def get_stock_stats_multi_indicators_window(
+    symbol: Annotated[str, "ticker symbol of the company"],
+    indicators: Annotated[list[str], "list of technical indicators (e.g. ['rsi','macd','close_50_sma'])"],
+    curr_date: Annotated[str, "The current trading date you are trading on, YYYY-mm-dd"],
+    look_back_days: Annotated[int, "how many days to look back"],
+    online: Annotated[bool, "to fetch data online or offline"],
+) -> str:
+    """
+    Batch version that composes a single report by looping over the existing
+    single-indicator implementation. This keeps semantics identical while
+    enabling higher-level tools to make **one** call for many indicators.
+    """
+    norm_inds = [i.strip() for i in indicators if isinstance(i, str) and i.strip()]
+    if not norm_inds:
+        return ""
+    print(f"[INTERFACE] Fetching stock stats (BATCH) for {symbol}: {len(norm_inds)} indicators, date {curr_date}")
+    parts: list[str] = []
+    for ind in sorted(set(norm_inds)):
+        try:
+            parts.append(
+                get_stock_stats_indicators_window(symbol, ind, curr_date, look_back_days, online)
+            )
+        except Exception as e:
+            parts.append(f"## {ind} error: {e}")
+    print(f"[INTERFACE] Completed stock stats (BATCH) for {symbol}")
+    return "\n\n".join(parts)
 
 
 def get_stockstats_indicator(
@@ -745,11 +821,17 @@ def get_YFin_data(
 
 def get_stock_news_openai(ticker, curr_date):
     config = get_config()
-    client = create_openai_client_with_custom_retry()  # keep proxy/base_url behavior
+    client = create_openai_client_with_custom_retry()
+
+    cache_rel = Path("stock") / ticker.upper() / f"{curr_date}.txt"
+    cached = _cache_read(cache_rel)
+    if cached:
+        print(f"[INTERFACE][CACHE HIT] stock news for {ticker} on {curr_date}")
+        return cached
 
     curr_dt_obj = datetime.strptime(curr_date, "%Y-%m-%d")
     start_date = (curr_dt_obj - timedelta(days=14)).strftime("%Y-%m-%d")
-    end_date = curr_date  # already a string
+    end_date = curr_date
 
     instructions = (
         "You are a news aggregator. Provide only factual information without analysis or interpretation."
@@ -775,22 +857,42 @@ For each item, provide:
 Just provide the raw information, no analysis or opinions.
 """.strip()
 
-    response = client.responses.create(
-        model=config["openai_model"],
-        instructions=instructions,
-        input=[{"role": "user", "content": user_prompt}],
-        tools=[{"type": "web_search_preview", "search_context_size": "medium"}],
-        max_output_tokens=4096,
-        top_p=1,
-        store=True,
-    )
-
-    return _extract_text(response)
+    try:
+        resp = _responses_with_retries(
+            client.responses.create,
+            model=config["openai_model"],
+            instructions=instructions,
+            input=[{"role": "user", "content": user_prompt}],
+            tools=[{"type": "web_search_preview", "search_context_size": "medium"}],
+            max_output_tokens=4096,
+            top_p=1,
+            store=True,
+        )
+        text = _extract_text(resp)
+        _cache_write(cache_rel, text)
+        return text
+    except Exception as e:
+        # Fallback: try Google News (no LLM) to keep pipeline moving
+        print(f"[INTERFACE][FALLBACK] stock news via Google News due to: {e}")
+        try:
+            text = get_google_news(ticker, curr_date, 14)
+            if text:
+                _cache_write(cache_rel, text)
+            return text
+        except Exception:
+            return ""
 
 
 def get_global_news_openai(curr_date):
     config = get_config()
-    client = create_openai_client_with_custom_retry() # keep proxy/base_url behavior
+    client = create_openai_client_with_custom_retry()
+
+    cache_rel = Path("global") / f"{curr_date}.txt"
+    cached = _cache_read(cache_rel)
+    if cached:
+        print(f"[INTERFACE][CACHE HIT] global news for {curr_date}")
+        return cached
+
     curr_dt_obj = datetime.strptime(curr_date, "%Y-%m-%d")
     start_date = (curr_dt_obj - timedelta(days=14)).strftime("%Y-%m-%d")
 
@@ -816,17 +918,29 @@ For each item, provide:
 Just provide the raw information, no analysis or commentary.
 """.strip()
 
-    response = client.responses.create(
-        model=config["openai_model"],
-        instructions=instructions,
-        input=[{"role": "user", "content": user_prompt}],
-        tools=[{"type": "web_search_preview", "search_context_size": "medium"}],        
-        max_output_tokens=4096,
-        top_p=1,
-        store=True,
-    )
-
-    return _extract_text(response)
+    try:
+        resp = _responses_with_retries(
+            client.responses.create,
+            model=config["openai_model"],
+            instructions=instructions,
+            input=[{"role": "user", "content": user_prompt}],
+            tools=[{"type": "web_search_preview", "search_context_size": "medium"}],
+            max_output_tokens=4096,
+            top_p=1,
+            store=True,
+        )
+        text = _extract_text(resp)
+        _cache_write(cache_rel, text)
+        return text
+    except Exception as e:
+        print(f"[INTERFACE][FALLBACK] global news via Google News due to: {e}")
+        try:
+            text = get_google_news("global markets", curr_date, 14)
+            if text:
+                _cache_write(cache_rel, text)
+            return text
+        except Exception:
+            return ""
 
 
 def get_fundamentals_openai(ticker, curr_date):

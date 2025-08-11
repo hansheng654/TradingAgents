@@ -16,6 +16,7 @@ TABLE OF CONTENTS (Python Files)
     - ./tradingagents/graph/setup.py
     - ./tradingagents/graph/propagation.py
     - ./tradingagents/graph/signal_processing.py
+      - ./tradingagents/graph/tests/test_graph_setup.py
     - ./tradingagents/agents/__init__.py
       - ./tradingagents/agents/researchers/bull_researcher.py
       - ./tradingagents/agents/researchers/bear_researcher.py
@@ -149,6 +150,12 @@ USE_MOCK = False  # CHANGE THIS TO False TO USE REAL AGENT
 if not USE_MOCK:
     from tradingagents.graph.trading_graph import TradingAgentsGraph
     from tradingagents.default_config import DEFAULT_CONFIG
+    try:
+        # Optional: start each backtest run with a clean embedding cache
+        from tradingagents.agents.utils.memory import clear_embedding_cache
+        clear_embedding_cache()
+    except Exception:
+        pass
 else:
     TradingAgentsGraph = MockTradingAgentsGraph
     DEFAULT_CONFIG = {}
@@ -283,7 +290,8 @@ class Backtester:
             return
 
         try:
-            final_state, decision = self.graph.propagate(self.ticker, trade_date)
+            # Pass ISO string for date; TradingAgentsGraph expects a YYYY-MM-DD string
+            final_state, decision = self.graph.propagate(self.ticker, trade_date.isoformat())
         except Exception as e:
             print(f"❌ {trade_date}: propagate error → {e}")
             traceback.print_exc()
@@ -491,7 +499,7 @@ if __name__ == "__main__":
         start_cash=1_000.0,
         fee=1.0,
         config_overrides=custom_cfg,
-        debug=False,
+        debug=True,
     )
 
     # Run trades
@@ -2353,11 +2361,27 @@ from tradingagents.agents.utils.agent_states import (
 )
 from tradingagents.dataflows.interface import set_config
 
-from .conditional_logic import ConditionalLogic
-from .setup import GraphSetup
-from .propagation import Propagator
-from .reflection import Reflector
-from .signal_processing import SignalProcessor
+# Support running as a package module or as a standalone script
+try:
+    from .conditional_logic import ConditionalLogic  # package-relative
+    from .setup import GraphSetup
+    from .propagation import Propagator
+    from .reflection import Reflector
+    from .signal_processing import SignalProcessor
+except Exception:
+    try:
+        # absolute imports when executed directly
+        from tradingagents.graph.conditional_logic import ConditionalLogic
+        from tradingagents.graph.setup import GraphSetup
+        from tradingagents.graph.propagation import Propagator
+        from tradingagents.graph.reflection import Reflector
+        from tradingagents.graph.signal_processing import SignalProcessor
+    except Exception as e:
+        raise ImportError(
+            "Could not import graph components. Try running as a module: \n"
+            "    python -m tradingagents.graph.trading_graph\n"
+            "or ensure project root is on PYTHONPATH."
+        ) from e
 
 
 class TradingAgentsGraph:
@@ -2403,12 +2427,8 @@ class TradingAgentsGraph:
         
         self.toolkit = Toolkit(config=self.config)
 
-        # Initialize memories
-        self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
-        self.bear_memory = FinancialSituationMemory("bear_memory", self.config)
-        self.trader_memory = FinancialSituationMemory("trader_memory", self.config)
-        self.invest_judge_memory = FinancialSituationMemory("invest_judge_memory", self.config)
-        self.risk_manager_memory = FinancialSituationMemory("risk_manager_memory", self.config)
+        # Initialize a single shared memory for retrieval & reflections
+        self.shared_memory = FinancialSituationMemory("situations", self.config)
 
         # Create tool nodes
         self.tool_nodes = self._create_tool_nodes()
@@ -2420,11 +2440,7 @@ class TradingAgentsGraph:
             self.deep_thinking_llm,
             self.toolkit,
             self.tool_nodes,
-            self.bull_memory,
-            self.bear_memory,
-            self.trader_memory,
-            self.invest_judge_memory,
-            self.risk_manager_memory,
+            self.shared_memory,
             self.conditional_logic,
         )
 
@@ -2445,7 +2461,8 @@ class TradingAgentsGraph:
         return {
             "market": ToolNode(
                 [
-                    # online tools
+                    # online tools (batch first to encourage single-call usage)
+                    self.toolkit.get_stockstats_multi_indicators_report_online,
                     self.toolkit.get_YFin_data_online,
                     self.toolkit.get_stockstats_indicators_report_online,
                     # offline tools
@@ -2522,34 +2539,33 @@ class TradingAgentsGraph:
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""
+        inv = final_state.get("investment_debate_state", {})
+        risk = final_state.get("risk_debate_state", {})
+
         self.log_states_dict[str(trade_date)] = {
-            "company_of_interest": final_state["company_of_interest"],
-            "trade_date": final_state["trade_date"],
-            "market_report": final_state["market_report"],
-            "sentiment_report": final_state["sentiment_report"],
-            "news_report": final_state["news_report"],
-            "fundamentals_report": final_state["fundamentals_report"],
+            "company_of_interest": final_state.get("company_of_interest", self.ticker or ""),
+            "trade_date": final_state.get("trade_date", str(trade_date)),
+            "market_report": final_state.get("market_report", ""),
+            "sentiment_report": final_state.get("sentiment_report", ""),
+            "news_report": final_state.get("news_report", ""),
+            "fundamentals_report": final_state.get("fundamentals_report", ""),
             "investment_debate_state": {
-                "bull_history": final_state["investment_debate_state"]["bull_history"],
-                "bear_history": final_state["investment_debate_state"]["bear_history"],
-                "history": final_state["investment_debate_state"]["history"],
-                "current_response": final_state["investment_debate_state"][
-                    "current_response"
-                ],
-                "judge_decision": final_state["investment_debate_state"][
-                    "judge_decision"
-                ],
+                "bull_history": inv.get("bull_history", ""),
+                "bear_history": inv.get("bear_history", ""),
+                "history": inv.get("history", ""),
+                "current_response": inv.get("current_response", ""),
+                "judge_decision": inv.get("judge_decision", ""),
             },
-            "trader_investment_decision": final_state["trader_investment_plan"],
+            "trader_investment_decision": final_state.get("trader_investment_plan", ""),
             "risk_debate_state": {
-                "risky_history": final_state["risk_debate_state"]["risky_history"],
-                "safe_history": final_state["risk_debate_state"]["safe_history"],
-                "neutral_history": final_state["risk_debate_state"]["neutral_history"],
-                "history": final_state["risk_debate_state"]["history"],
-                "judge_decision": final_state["risk_debate_state"]["judge_decision"],
+                "risky_history": risk.get("risky_history", ""),
+                "safe_history": risk.get("safe_history", ""),
+                "neutral_history": risk.get("neutral_history", ""),
+                "history": risk.get("history", ""),
+                "judge_decision": risk.get("judge_decision", ""),
             },
-            "investment_plan": final_state["investment_plan"],
-            "final_trade_decision": final_state["final_trade_decision"],
+            "investment_plan": final_state.get("investment_plan", ""),
+            "final_trade_decision": final_state.get("final_trade_decision", ""),
         }
 
         # Save to file
@@ -2563,26 +2579,187 @@ class TradingAgentsGraph:
             json.dump(self.log_states_dict, f, indent=4)
 
     def reflect_and_remember(self, returns_losses):
-        """Reflect on decisions and update memory based on returns."""
+        """Reflect on decisions and update memory based on returns.
+        Uses the shared memory store for all roles to keep retrieval unified.
+        """
         self.reflector.reflect_bull_researcher(
-            self.curr_state, returns_losses, self.bull_memory
+            self.curr_state, returns_losses, self.shared_memory
         )
         self.reflector.reflect_bear_researcher(
-            self.curr_state, returns_losses, self.bear_memory
+            self.curr_state, returns_losses, self.shared_memory
         )
         self.reflector.reflect_trader(
-            self.curr_state, returns_losses, self.trader_memory
+            self.curr_state, returns_losses, self.shared_memory
         )
         self.reflector.reflect_invest_judge(
-            self.curr_state, returns_losses, self.invest_judge_memory
+            self.curr_state, returns_losses, self.shared_memory
         )
         self.reflector.reflect_risk_manager(
-            self.curr_state, returns_losses, self.risk_manager_memory
+            self.curr_state, returns_losses, self.shared_memory
         )
 
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""
         return self.signal_processor.process_signal(full_signal)
+
+
+# === Self-test harness for TradingAgentsGraph wiring ===
+if __name__ == "__main__":
+    """
+    Lightweight end-to-end self-test for TradingAgentsGraph wiring with the Memory Broker.
+    - Avoids any network/LLM/tool calls by monkeypatching dependencies to dummies.
+    - Verifies that analysts run, Memory Broker populates preview, and the flow reaches a final decision.
+
+    Run:
+        python tradingagents/graph/trading_graph.py
+    """
+    from types import SimpleNamespace
+    from datetime import datetime, timezone
+    import tradingagents.graph.setup as setup_mod
+
+    print("\n== TradingAgentsGraph wiring self-test ==\n")
+
+    # ---- Dummy LLM that matches Chat* constructors and captures prompts ----
+    class DummyLLM:
+        def __init__(self, model=None, base_url=None, **kwargs):
+            self.model = model
+            self.base_url = base_url
+            self.calls = 0
+            self.last_input = None
+        def invoke(self, x):
+            self.calls += 1
+            self.last_input = x
+            return SimpleNamespace(content="DUMMY: ok")
+
+    # Monkeypatch the LLM classes used in this module (so __init__ succeeds without network)
+    ChatOpenAI = DummyLLM          # type: ignore
+    ChatAnthropic = DummyLLM       # type: ignore
+    ChatGoogleGenerativeAI = DummyLLM  # type: ignore
+
+    # ---- Dummy Shared Memory so Memory Broker does not embed/call APIs ----
+    class DummySharedMemory:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+        def get_memories(self, current_situation, n_matches=2):
+            self.calls += 1
+            # Return two simple memories
+            return [
+                {
+                    "matched_situation": "Tech rotation with rising yields",
+                    "recommendation": "Reduce duration; prefer cash-flow positive leaders.",
+                    "similarity_score": 0.71,
+                },
+                {
+                    "matched_situation": "Earnings season defensives bid",
+                    "recommendation": "Increase staples/utilities; hedge beta.",
+                    "similarity_score": 0.53,
+                },
+            ][:n_matches]
+
+    # Patch the FinancialSituationMemory symbol in this module to our dummy
+    FinancialSituationMemory = DummySharedMemory  # type: ignore
+
+    # ---- Patch tool nodes to pure no-ops (no external calls) ----
+    def _noop_tool(state):
+        return {}
+    def _no_tool_nodes(self):
+        return {
+            "market": _noop_tool,
+            "social": _noop_tool,
+            "news": _noop_tool,
+            "fundamentals": _noop_tool,
+        }
+    TradingAgentsGraph._create_tool_nodes = _no_tool_nodes  # type: ignore
+
+    # ---- Control flow logic: always advance deterministically ----
+    class DummyConditionalLogic:
+        # Analysts: always choose 'clear' branch (advance)
+        def __getattr__(self, name):
+            if name.startswith("should_continue_"):
+                return lambda state: "clear"
+            raise AttributeError(name)
+        # Debate: jump to Research Manager immediately
+        def should_continue_debate(self, state):
+            return "Research Manager"
+        # Risk: jump to Risk Judge for final decision
+        def should_continue_risk_analysis(self, state):
+            return "Risk Judge"
+
+    # Patch ConditionalLogic used by this module
+    ConditionalLogic = DummyConditionalLogic  # type: ignore
+
+    # ---- Monkeypatch node factories inside setup module under test ----
+    def _mk_long_report(name, key):
+        def node(state):
+            filler = (
+                f" {name} context: RSI 65, MACD bullish, CPI 3.2% YoY, EPS +10%, "
+                f"tickers AAPL NVDA MSFT; liquidity ample; breadth improving."
+            ) * 60  # ensure Memory Broker triggers with production thresholds
+            return {key: f"{name} report OK at {datetime.now(timezone.utc).isoformat()}." + filler}
+        return node
+
+    def _mk_clear():
+        def node(state):
+            return {}
+        return node
+
+    def _mk_set(key, value):
+        def node(state):
+            return {key: value}
+        return node
+
+    # Analysts
+    setup_mod.create_market_analyst = lambda llm, tk: _mk_long_report("Market", "market_report")  # type: ignore
+    setup_mod.create_social_media_analyst = lambda llm, tk: _mk_long_report("Social", "sentiment_report")  # type: ignore
+    setup_mod.create_news_analyst = lambda llm, tk: _mk_long_report("News", "news_report")  # type: ignore
+    setup_mod.create_fundamentals_analyst = lambda llm, tk: _mk_long_report("Fundamentals", "fundamentals_report")  # type: ignore
+    setup_mod.create_msg_delete = lambda: _mk_clear()  # type: ignore
+
+    # Researchers & manager (minimal outputs)
+    setup_mod.create_bull_researcher = lambda llm, mem: _mk_set("investment_debate_state", {"bull_history": "BULL ok"})  # type: ignore
+    setup_mod.create_bear_researcher = lambda llm, mem: _mk_set("investment_debate_state", {"bear_history": "BEAR ok"})  # type: ignore
+    setup_mod.create_research_manager = lambda llm, mem: _mk_set("investment_plan", "RM: BUY with plan")  # type: ignore
+
+    # Trader
+    setup_mod.create_trader = lambda llm, mem: _mk_set("trader_investment_plan", "TRADER: BUY on signal")  # type: ignore
+
+    # Risk debators & judge; judge emits final decision
+    setup_mod.create_risky_debator = lambda llm: _mk_set("risk_debate_state", {"risky_history": "RISKY ok"})  # type: ignore
+    setup_mod.create_neutral_debator = lambda llm: _mk_set("risk_debate_state", {"neutral_history": "NEUTRAL ok"})  # type: ignore
+    setup_mod.create_safe_debator = lambda llm: _mk_set("risk_debate_state", {"safe_history": "SAFE ok"})  # type: ignore
+    setup_mod.create_risk_manager = lambda llm, mem: (  # type: ignore
+        _mk_set("final_trade_decision", "FINAL: BUY")
+    )
+
+    # ---- Build config (no real endpoints used) ----
+    cfg = DEFAULT_CONFIG.copy()
+    cfg["llm_provider"] = "openai"
+    cfg["backend_url"] = "http://localhost"
+    cfg["deep_think_llm"] = "dummy-deep"
+    cfg["quick_think_llm"] = "dummy-quick"
+    cfg["online_tools"] = False
+
+    # ---- Instantiate and run once ----
+    graph = TradingAgentsGraph(selected_analysts=["market", "news"], debug=False, config=cfg)
+    final_state, decision = graph.propagate("TEST", "2025-01-01")
+
+    # ---- Diagnostics ----
+    produced_keys = [k for k in final_state.keys() if k in (
+        "market_report","news_report","past_memories","past_memories_preview","past_memories_str",
+        "investment_plan","trader_investment_plan","risk_debate_state","final_trade_decision"
+    )]
+    print("Produced keys:", produced_keys)
+    print("past_memories count:", len(final_state.get("past_memories", [])))
+    print("preview len:", len((final_state.get("past_memories_preview") or "")))
+    print("final decision:", final_state.get("final_trade_decision"))
+
+    # ---- Assertions ----
+    assert "market_report" in final_state and "news_report" in final_state, "Analyst reports missing"
+    assert isinstance(final_state.get("past_memories"), list), "Memory Broker did not populate past_memories"
+    assert isinstance(final_state.get("past_memories_preview"), str), "No preview string from Memory Broker"
+    assert final_state.get("final_trade_decision") in ("FINAL: BUY", "BUY", "SELL", "HOLD"), "No final decision produced"
+
+    print("\nTradingAgentsGraph wiring self-test passed.\n")
 
 ===== END OF FILE: ./tradingagents/graph/trading_graph.py =====
 
@@ -2666,10 +2843,11 @@ from langgraph.graph import END, StateGraph, START
 from langgraph.prebuilt import ToolNode
 
 from tradingagents.agents import *
-from tradingagents.agents.utils.agent_states import AgentState
+from tradingagents.agents.utils.agent_states import AgentState, create_memory_broker
 from tradingagents.agents.utils.agent_utils import Toolkit
 
-from .conditional_logic import ConditionalLogic
+# from .conditional_logic import ConditionalLogic
+from tradingagents.graph.conditional_logic import ConditionalLogic
 
 
 class GraphSetup:
@@ -2681,11 +2859,7 @@ class GraphSetup:
         deep_thinking_llm: ChatOpenAI,
         toolkit: Toolkit,
         tool_nodes: Dict[str, ToolNode],
-        bull_memory,
-        bear_memory,
-        trader_memory,
-        invest_judge_memory,
-        risk_manager_memory,
+        shared_memory,
         conditional_logic: ConditionalLogic,
     ):
         """Initialize with required components."""
@@ -2693,11 +2867,7 @@ class GraphSetup:
         self.deep_thinking_llm = deep_thinking_llm
         self.toolkit = toolkit
         self.tool_nodes = tool_nodes
-        self.bull_memory = bull_memory
-        self.bear_memory = bear_memory
-        self.trader_memory = trader_memory
-        self.invest_judge_memory = invest_judge_memory
-        self.risk_manager_memory = risk_manager_memory
+        self.shared_memory = shared_memory
         self.conditional_logic = conditional_logic
 
     def setup_graph(
@@ -2750,22 +2920,22 @@ class GraphSetup:
 
         # Create researcher and manager nodes
         bull_researcher_node = create_bull_researcher(
-            self.quick_thinking_llm, self.bull_memory
+            self.quick_thinking_llm, self.shared_memory
         )
         bear_researcher_node = create_bear_researcher(
-            self.quick_thinking_llm, self.bear_memory
+            self.quick_thinking_llm, self.shared_memory
         )
         research_manager_node = create_research_manager(
-            self.deep_thinking_llm, self.invest_judge_memory
+            self.deep_thinking_llm, self.shared_memory
         )
-        trader_node = create_trader(self.quick_thinking_llm, self.trader_memory)
+        trader_node = create_trader(self.quick_thinking_llm, self.shared_memory)
 
         # Create risk analysis nodes
         risky_analyst = create_risky_debator(self.quick_thinking_llm)
         neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
         safe_analyst = create_safe_debator(self.quick_thinking_llm)
         risk_manager_node = create_risk_manager(
-            self.deep_thinking_llm, self.risk_manager_memory
+            self.deep_thinking_llm, self.shared_memory
         )
 
         # Create workflow
@@ -2789,6 +2959,17 @@ class GraphSetup:
         workflow.add_node("Safe Analyst", safe_analyst)
         workflow.add_node("Risk Judge", risk_manager_node)
 
+        # Memory Broker node: compute memories once for all downstream agents
+        memory_broker_node = create_memory_broker(
+            self.shared_memory,
+            n_matches=2,
+            min_chars=800,
+            summary_max_tokens=1200,
+            llm_only_if_needed=True,
+            preview_trigger_chars=2048,
+        )
+        workflow.add_node("Memory Broker", memory_broker_node)
+
         # Define edges
         # Start with the first analyst
         first_analyst = selected_analysts[0]
@@ -2800,20 +2981,23 @@ class GraphSetup:
             current_tools = f"tools_{analyst_type}"
             current_clear = f"Msg Clear {analyst_type.capitalize()}"
 
-            # Add conditional edges for current analyst
+            # Add conditional edges for current analyst, mapping keys to match ConditionalLogic returns
             workflow.add_conditional_edges(
                 current_analyst,
                 getattr(self.conditional_logic, f"should_continue_{analyst_type}"),
-                [current_tools, current_clear],
+                {
+                    f"tools_{analyst_type}": current_tools,
+                    f"Msg Clear {analyst_type.capitalize()}": current_clear,
+                },
             )
             workflow.add_edge(current_tools, current_analyst)
 
-            # Connect to next analyst or to Bull Researcher if this is the last analyst
+            # Connect to next analyst or to Memory Broker if this is the last analyst
             if i < len(selected_analysts) - 1:
                 next_analyst = f"{selected_analysts[i+1].capitalize()} Analyst"
                 workflow.add_edge(current_clear, next_analyst)
             else:
-                workflow.add_edge(current_clear, "Bull Researcher")
+                workflow.add_edge(current_clear, "Memory Broker")
 
         # Add remaining edges
         workflow.add_conditional_edges(
@@ -2832,6 +3016,10 @@ class GraphSetup:
                 "Research Manager": "Research Manager",
             },
         )
+
+        # After computing memories, proceed to the debate
+        workflow.add_edge("Memory Broker", "Bull Researcher")
+
         workflow.add_edge("Research Manager", "Trader")
         workflow.add_edge("Trader", "Risky Analyst")
         workflow.add_conditional_edges(
@@ -2839,6 +3027,7 @@ class GraphSetup:
             self.conditional_logic.should_continue_risk_analysis,
             {
                 "Safe Analyst": "Safe Analyst",
+                "Neutral Analyst": "Neutral Analyst",
                 "Risk Judge": "Risk Judge",
             },
         )
@@ -2847,6 +3036,7 @@ class GraphSetup:
             self.conditional_logic.should_continue_risk_analysis,
             {
                 "Neutral Analyst": "Neutral Analyst",
+                "Risky Analyst": "Risky Analyst",
                 "Risk Judge": "Risk Judge",
             },
         )
@@ -2855,14 +3045,149 @@ class GraphSetup:
             self.conditional_logic.should_continue_risk_analysis,
             {
                 "Risky Analyst": "Risky Analyst",
+                "Safe Analyst": "Safe Analyst",
                 "Risk Judge": "Risk Judge",
             },
         )
 
         workflow.add_edge("Risk Judge", END)
 
+
         # Compile and return
         return workflow.compile()
+
+
+# --- Lightweight self-test harness ---
+if __name__ == "__main__":
+    """
+    Lightweight wiring test for GraphSetup and the Memory Broker.
+    This avoids real LLM/tool calls by monkeypatching the agent node factories
+    with simple no-op nodes, and using a dummy shared memory object.
+
+    Run:
+        python tradingagents/graph/setup.py
+    Expected:
+        - Graph compiles
+        - Single run produces analyst reports
+        - Memory Broker populates past_memories & preview string
+        - No infinite loops; research moves to manager, then trader, then risk judge.
+    """
+    from types import SimpleNamespace
+    from datetime import datetime
+
+    # ---- Dummy shared memory (no network) ----
+    class DummySharedMemory:
+        def __init__(self):
+            self.calls = 0
+        def get_memories(self, current_situation, n_matches=2):
+            self.calls += 1
+            return [
+                {
+                    "matched_situation": "Prior tech selloff with rising yields",
+                    "recommendation": "Reduce high-duration growth. Tilt to cash-flow positive names.",
+                    "similarity_score": 0.71,
+                },
+                {
+                    "matched_situation": "Rotation into defensives during earnings",
+                    "recommendation": "Increase exposure to staples/utilities; hedge beta.",
+                    "similarity_score": 0.54,
+                },
+            ][:n_matches]
+
+    # ---- Dummy conditional logic ----
+    class DummyConditionalLogic:
+        # For analysts: always choose the 'clear' branch (advance), avoid looping on tools
+        def __getattr__(self, name):
+            if name.startswith("should_continue_"):
+                return lambda state: "clear"  # branch label must match keys in mapping
+            raise AttributeError(name)
+        # For debate: pick Research Manager to end debate
+        def should_continue_debate(self, state):
+            return "Research Manager"
+        # For risk: jump straight to Risk Judge
+        def should_continue_risk_analysis(self, state):
+            return "Risk Judge"
+
+    # ---- Monkeypatch agent node creators with trivial nodes ----
+    # Each returns a callable(state)->dict that sets expected fields.
+    from datetime import datetime, timezone
+    def _mk_report(name, key):
+        def node(state):
+            # Make the analyst report long enough to exceed broker min_chars when combined
+            filler = (" " + name + " context with numbers 123 and tickers AAPL NVDA MSFT, macro CPI 3.2% YoY, EPS +10%.") * 60
+            return {key: f"{name} report OK at {datetime.now(timezone.utc).isoformat()}." + filler}
+        return node
+    def _mk_clear():
+        def node(state):
+            return {}
+        return node
+    def _mk_pass(name, key):
+        def node(state):
+            # Append to the messages log if present, else just set a marker
+            return {key: f"{name} OK"}
+        return node
+
+    # Patch imported factory functions in this module's globals
+    g = globals()
+    g["create_market_analyst"] = lambda llm, tk: _mk_report("Market", "market_report")
+    g["create_social_media_analyst"] = lambda llm, tk: _mk_report("Social", "sentiment_report")
+    g["create_news_analyst"] = lambda llm, tk: _mk_report("News", "news_report")
+    g["create_fundamentals_analyst"] = lambda llm, tk: _mk_report("Fundamentals", "fundamentals_report")
+    g["create_msg_delete"] = lambda: _mk_clear()
+
+    g["create_bull_researcher"] = lambda llm, mem: _mk_pass("Bull", "investment_debate_state")
+    g["create_bear_researcher"] = lambda llm, mem: _mk_pass("Bear", "investment_debate_state")
+    g["create_research_manager"] = lambda llm, mem: _mk_pass("Research Manager", "investment_debate_state")
+
+    g["create_trader"] = lambda llm, mem: _mk_pass("Trader", "trader_investment_plan")
+
+    g["create_risky_debator"] = lambda llm: _mk_pass("Risky", "risk_debate_state")
+    g["create_neutral_debator"] = lambda llm: _mk_pass("Neutral", "risk_debate_state")
+    g["create_safe_debator"] = lambda llm: _mk_pass("Safe", "risk_debate_state")
+    g["create_risk_manager"] = lambda llm, mem: _mk_pass("Risk Judge", "risk_debate_state")
+
+    # Tool nodes can be simple no-op functions
+    tools = {k: (lambda state: {}) for k in ["market", "social", "news", "fundamentals"]}
+
+
+    # Build the graph
+    setup = GraphSetup(
+        quick_thinking_llm=None,
+        deep_thinking_llm=None,
+        toolkit=SimpleNamespace(),
+        tool_nodes=tools,
+        shared_memory=DummySharedMemory(),
+        conditional_logic=DummyConditionalLogic(),
+    )
+
+    app = setup.setup_graph(selected_analysts=["market", "news"])  # keep it small
+
+    # Run once with a minimal initial state
+    init_state = {
+        "ticker": "TEST",
+        "analysis_date": "2025-01-01",
+        # fields the graph may expect
+        "messages": [],
+    }
+
+    print("\n== Running wiring self-test ==\n")
+    out = app.invoke(init_state)
+
+    # Basic assertions / prints
+    keys = [k for k in out.keys() if k in (
+        "market_report", "news_report", "past_memories", "past_memories_preview", "past_memories_str",
+        "investment_debate_state", "trader_investment_plan", "risk_debate_state"
+    )]
+
+    print("Produced keys:", keys)
+    print("past_memories count:", len(out.get("past_memories", [])))
+    print("preview len:", len((out.get("past_memories_preview") or "")))
+
+    assert "market_report" in out and "news_report" in out, "Analyst reports missing"
+    assert isinstance(out.get("past_memories"), list), "Memory Broker did not populate past_memories"
+    assert isinstance(out.get("past_memories_preview"), str), "No preview string from Memory Broker"
+
+    print("\nGraph wiring self-test passed.\n")
 
 ===== END OF FILE: ./tradingagents/graph/setup.py =====
 
@@ -2954,6 +3279,407 @@ class SignalProcessor:
 
 ===== END OF FILE: ./tradingagents/graph/signal_processing.py =====
 
+===== FILE: ./tradingagents/graph/tests/test_graph_setup.py =====
+"""
+Comprehensive test suite for TradingAgents GraphSetup.
+Improvements over original:
+1. Multiple test scenarios with different analyst combinations
+2. Better state transition tracking
+3. Memory broker interaction validation
+4. Error case testing
+5. Conditional logic path verification
+6. More thorough assertions
+"""
+
+
+import sys
+from pathlib import Path
+from typing import Dict, Any, List
+from types import SimpleNamespace
+from datetime import datetime, timezone
+from collections import defaultdict
+import traceback
+
+# Ensure project root is on sys.path so package imports work when run directly
+_HERE = Path(__file__).resolve()
+_ROOT = _HERE.parents[3]  # repo root (.. / .. / ..)
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import tradingagents.graph.setup as setup_mod
+
+# ---- Enhanced Dummy Components ----
+
+class TestTracker:
+    """Tracks execution flow through the graph for validation."""
+    def __init__(self):
+        self.node_visits = []
+        self.state_mutations = defaultdict(list)
+        self.conditional_decisions = []
+        
+    def visit_node(self, node_name: str):
+        self.node_visits.append((node_name, datetime.now(timezone.utc)))
+        
+    def record_state_change(self, key: str, value: Any):
+        self.state_mutations[key].append(value)
+        
+    def record_decision(self, node: str, decision: str):
+        self.conditional_decisions.append((node, decision))
+        
+    def get_flow_path(self) -> List[str]:
+        return [name for name, _ in self.node_visits]
+
+
+class EnhancedDummySharedMemory:
+    """Enhanced dummy memory with call tracking and configurable responses."""
+    def __init__(self, tracker: TestTracker):
+        self.calls = 0
+        self.tracker = tracker
+        self.memory_responses = {
+            "default": [
+                {
+                    "matched_situation": "Prior tech selloff with rising yields",
+                    "recommendation": "Reduce high-duration growth. Tilt to cash-flow positive names.",
+                    "similarity_score": 0.71,
+                },
+                {
+                    "matched_situation": "Rotation into defensives during earnings",
+                    "recommendation": "Increase exposure to staples/utilities; hedge beta.",
+                    "similarity_score": 0.54,
+                },
+            ]
+        }
+        
+    def get_memories(self, current_situation, n_matches=2):
+        self.calls += 1
+        self.tracker.record_state_change("memory_queries", current_situation[:50])
+        return self.memory_responses["default"][:n_matches]
+    
+    def set_test_memories(self, key: str, memories: List[Dict]):
+        """Allow tests to configure specific memory responses."""
+        self.memory_responses[key] = memories
+
+
+class ConfigurableConditionalLogic:
+    """Conditional logic that can be configured for different test scenarios."""
+    def __init__(self, tracker: TestTracker, scenario="default"):
+        self.tracker = tracker
+        self.scenario = scenario
+        self.debate_count = 0
+        self.risk_count = 0
+        
+    def _analyst_continue(self, analyst_type: str):
+        """Configurable analyst continuation logic."""
+        def logic(state):
+            # Always go to clear for now, but track the decision
+            self.tracker.record_decision(f"{analyst_type}_analyst", "clear")
+            return "clear"
+        return logic
+        
+    def __getattr__(self, name):
+        if name.startswith("should_continue_") and not name.endswith("debate") and not name.endswith("risk_analysis"):
+            analyst_type = name.replace("should_continue_", "")
+            return self._analyst_continue(analyst_type)
+        raise AttributeError(name)
+    
+    def should_continue_debate(self, state):
+        """Simulate a few rounds of debate before moving to manager."""
+        self.debate_count += 1
+        if self.scenario == "extended_debate":
+            # Extended debate scenario
+            if self.debate_count < 4:
+                next_node = "Bear Researcher" if self.debate_count % 2 == 1 else "Bull Researcher"
+                self.tracker.record_decision("debate", next_node)
+                return next_node
+        elif self.scenario == "quick_consensus":
+            # Quick consensus scenario
+            self.tracker.record_decision("debate", "Research Manager")
+            return "Research Manager"
+        else:
+            # Default: 2 rounds then manager
+            if self.debate_count < 2:
+                next_node = "Bear Researcher" if self.debate_count % 2 == 1 else "Bull Researcher"
+                self.tracker.record_decision("debate", next_node)
+                return next_node
+        
+        self.tracker.record_decision("debate", "Research Manager")
+        return "Research Manager"
+    
+    def should_continue_risk_analysis(self, state):
+        """Simulate risk analysis rounds."""
+        self.risk_count += 1
+        if self.scenario == "high_risk_debate":
+            # Extended risk debate
+            if self.risk_count < 3:
+                nodes = ["Safe Analyst", "Neutral Analyst", "Risky Analyst"]
+                next_node = nodes[self.risk_count % 3]
+                self.tracker.record_decision("risk", next_node)
+                return next_node
+        
+        # Default: straight to judge
+        self.tracker.record_decision("risk", "Risk Judge")
+        return "Risk Judge"
+
+
+# ---- Enhanced Node Factories ----
+
+def create_tracked_analyst(name: str, key: str, tracker: TestTracker):
+    """Create an analyst node that tracks its execution."""
+    def node(state):
+        tracker.visit_node(name)
+        # Generate report with enough content to trigger memory broker (large enough for prod thresholds)
+        filler = (f" {name} analysis: volatility 15%, RSI 65, MACD bullish, volume above average, support at $150, resistance at $165; tickers AAPL NVDA MSFT; CPI 3.2% YoY; EPS +10%. " * 80)
+        report = f"{name} report at {datetime.now(timezone.utc).isoformat()}" + filler
+        tracker.record_state_change(key, report[:100])  # Track first 100 chars
+        return {key: report}
+    return node
+
+
+def create_tracked_clear(name: str, tracker: TestTracker):
+    """Create a clear node that tracks its execution."""
+    def node(state):
+        tracker.visit_node(f"Clear_{name}")
+        return {}
+    return node
+
+
+def create_tracked_agent(name: str, key: str, tracker: TestTracker):
+    """Create a generic agent node that tracks its execution."""
+    def node(state):
+        tracker.visit_node(name)
+        value = f"{name} output at {datetime.now(timezone.utc).isoformat()}"
+        tracker.record_state_change(key, value)
+        return {key: value}
+    return node
+
+
+def create_tracked_tool(name: str, tracker: TestTracker):
+    """Create a tool node that tracks its execution."""
+    def node(state):
+        tracker.visit_node(f"Tool_{name}")
+        return {}
+    return node
+
+
+# ---- Test Scenarios ----
+
+def test_scenario(scenario_name: str, analysts: List[str], logic_scenario: str = "default"):
+    """Run a test scenario with given configuration."""
+    print(f"\n{'='*60}")
+    print(f"Testing: {scenario_name}")
+    print(f"Analysts: {analysts}")
+    print(f"Logic scenario: {logic_scenario}")
+    print('='*60)
+    
+    tracker = TestTracker()
+    
+    # Patch the factory functions inside the setup module under test
+    setup_mod.create_market_analyst = lambda llm, tk: create_tracked_analyst("Market", "market_report", tracker)
+    setup_mod.create_social_media_analyst = lambda llm, tk: create_tracked_analyst("Social", "sentiment_report", tracker)
+    setup_mod.create_news_analyst = lambda llm, tk: create_tracked_analyst("News", "news_report", tracker)
+    setup_mod.create_fundamentals_analyst = lambda llm, tk: create_tracked_analyst("Fundamentals", "fundamentals_report", tracker)
+    setup_mod.create_msg_delete = lambda: create_tracked_clear("Messages", tracker)
+
+    setup_mod.create_bull_researcher = lambda llm, mem: create_tracked_agent("Bull", "investment_debate_state", tracker)
+    setup_mod.create_bear_researcher = lambda llm, mem: create_tracked_agent("Bear", "investment_debate_state", tracker)
+    setup_mod.create_research_manager = lambda llm, mem: create_tracked_agent("ResearchManager", "investment_debate_state", tracker)
+
+    setup_mod.create_trader = lambda llm, mem: create_tracked_agent("Trader", "trader_investment_plan", tracker)
+
+    setup_mod.create_risky_debator = lambda llm: create_tracked_agent("Risky", "risk_debate_state", tracker)
+    setup_mod.create_neutral_debator = lambda llm: create_tracked_agent("Neutral", "risk_debate_state", tracker)
+    setup_mod.create_safe_debator = lambda llm: create_tracked_agent("Safe", "risk_debate_state", tracker)
+    setup_mod.create_risk_manager = lambda llm, mem: create_tracked_agent("RiskJudge", "risk_debate_state", tracker)
+
+    # Tool nodes
+    tools = {
+        "market": create_tracked_tool("market", tracker),
+        "social": create_tracked_tool("social", tracker),
+        "news": create_tracked_tool("news", tracker),
+        "fundamentals": create_tracked_tool("fundamentals", tracker),
+    }
+
+    # Build the graph using the setup module's GraphSetup
+    setup = setup_mod.GraphSetup(
+        quick_thinking_llm=None,
+        deep_thinking_llm=None,
+        toolkit=SimpleNamespace(),
+        tool_nodes=tools,
+        shared_memory=EnhancedDummySharedMemory(tracker),
+        conditional_logic=ConfigurableConditionalLogic(tracker, logic_scenario),
+    )
+
+    try:
+        app = setup.setup_graph(selected_analysts=analysts)
+
+        # Run with initial state
+        init_state = {
+            "ticker": "TEST",
+            "analysis_date": "2025-01-01",
+            "messages": [],
+        }
+
+        result = app.invoke(init_state)
+        # Optional diagnostics: print memory preview length
+        if "past_memories_preview" in result:
+            print(f"Memory preview length: {len(result['past_memories_preview'])}")
+
+        # Validate results
+        validate_results(scenario_name, result, tracker, analysts)
+
+        return True, tracker
+
+    except Exception as e:
+        print(f"❌ Scenario failed with error: {e}")
+        traceback.print_exc()
+        return False, tracker
+
+
+def validate_results(scenario_name: str, result: Dict, tracker: TestTracker, analysts: List[str]):
+    """Validate the results of a test scenario."""
+    print("\n📊 Validation Results:")
+    
+    # Check analyst reports
+    analyst_keys = {
+        "market": "market_report",
+        "social": "sentiment_report", 
+        "news": "news_report",
+        "fundamentals": "fundamentals_report"
+    }
+    
+    for analyst in analysts:
+        key = analyst_keys[analyst]
+        assert key in result, f"Missing {analyst} report"
+        assert len(result[key]) > 100, f"{analyst} report too short"
+        print(f"  ✓ {analyst} report present ({len(result[key])} chars)")
+    
+    # Check memory broker
+    assert "past_memories" in result, "Memory broker didn't populate past_memories"
+    assert isinstance(result["past_memories"], list), "past_memories not a list"
+    assert len(result["past_memories"]) > 0, "No memories retrieved"
+    print(f"  ✓ Memory broker: {len(result['past_memories'])} memories")
+    
+    if "past_memories_preview" in result:
+        assert isinstance(result["past_memories_preview"], str), "Preview not a string"
+        print(f"  ✓ Memory preview: {len(result['past_memories_preview'])} chars")
+    
+    # Check flow path
+    flow = tracker.get_flow_path()
+    print(f"\n📍 Execution flow ({len(flow)} nodes):")
+    
+    # Verify expected flow patterns
+    expected_start = [f"{analysts[0].capitalize()}" for _ in range(1)]  # First analyst
+    actual_start = flow[:1]
+    
+    # Print condensed flow
+    print(f"  Start: {' -> '.join(flow[:3])}")
+    if len(flow) > 6:
+        print(f"  Middle: ... {len(flow)-6} nodes ...")
+    print(f"  End: {' -> '.join(flow[-3:])}")
+    
+    # Check key stages were hit
+    assert "Bull" in flow, "Bull researcher not executed"
+    assert "ResearchManager" in flow, "Research manager not executed"
+    assert "Trader" in flow, "Trader not executed"
+    assert "RiskJudge" in flow, "Risk judge not executed"
+    print("  ✓ All key stages executed")
+    
+    # Check state mutations
+    print(f"\n🔄 State mutations: {len(tracker.state_mutations)} keys modified")
+    for key, values in list(tracker.state_mutations.items())[:3]:
+        print(f"  - {key}: {len(values)} updates")
+    
+    # Check conditional decisions
+    print(f"\n🔀 Conditional decisions: {len(tracker.conditional_decisions)} made")
+    for node, decision in tracker.conditional_decisions[:3]:
+        print(f"  - {node} → {decision}")
+    
+    print(f"\n✅ Scenario '{scenario_name}' passed all validations")
+
+
+def test_error_cases():
+    """Test error handling."""
+    print(f"\n{'='*60}")
+    print("Testing: Error Cases")
+    print('='*60)
+
+    # Use the setup module for error-case tests
+    # Test 1: No analysts selected
+    try:
+        setup = setup_mod.GraphSetup(
+            quick_thinking_llm=None,
+            deep_thinking_llm=None,
+            toolkit=SimpleNamespace(),
+            tool_nodes={},
+            shared_memory=EnhancedDummySharedMemory(TestTracker()),
+            conditional_logic=ConfigurableConditionalLogic(TestTracker()),
+        )
+        app = setup.setup_graph(selected_analysts=[])
+        print("❌ Should have raised ValueError for empty analysts")
+        return False
+    except ValueError as e:
+        if "no analysts selected" in str(e):
+            print("✓ Correctly raised ValueError for empty analysts")
+        else:
+            print(f"❌ Wrong error message: {e}")
+            return False
+
+    return True
+
+
+# ---- Main Test Runner ----
+
+def run_all_tests():
+    """Run comprehensive test suite."""
+    print("\n" + "="*60)
+    print(" TradingAgents Graph Setup - Comprehensive Test Suite")
+    print("="*60)
+    
+    results = []
+    
+    # Test different analyst combinations
+    test_configs = [
+        ("Single Analyst", ["market"], "default"),
+        ("Two Analysts", ["market", "news"], "default"),
+        ("All Analysts", ["market", "social", "news", "fundamentals"], "default"),
+        ("Extended Debate", ["market", "news"], "extended_debate"),
+        ("Quick Consensus", ["fundamentals"], "quick_consensus"),
+        ("High Risk Debate", ["market", "social"], "high_risk_debate"),
+    ]
+    
+    for scenario_name, analysts, logic_scenario in test_configs:
+        success, tracker = test_scenario(scenario_name, analysts, logic_scenario)
+        results.append((scenario_name, success))
+    
+    # Test error cases
+    error_success = test_error_cases()
+    results.append(("Error Cases", error_success))
+    
+    # Summary
+    print("\n" + "="*60)
+    print(" TEST SUMMARY")
+    print("="*60)
+    
+    passed = sum(1 for _, success in results if success)
+    total = len(results)
+    
+    for name, success in results:
+        status = "✅ PASS" if success else "❌ FAIL"
+        print(f"  {status} - {name}")
+    
+    print(f"\nTotal: {passed}/{total} passed")
+    
+    if passed == total:
+        print("\n🎉 All tests passed successfully!")
+    else:
+        print(f"\n⚠️ {total - passed} test(s) failed")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    run_all_tests()
+===== END OF FILE: ./tradingagents/graph/tests/test_graph_setup.py =====
+
 ===== FILE: ./tradingagents/agents/__init__.py =====
 from .utils.agent_utils import Toolkit, create_msg_delete
 from .utils.agent_states import AgentState, InvestDebateState, RiskDebateState
@@ -3012,17 +3738,31 @@ def create_bull_researcher(llm, memory):
         bull_history = investment_debate_state.get("bull_history", "")
 
         current_response = investment_debate_state.get("current_response", "")
-        market_research_report = state["market_report"]
-        sentiment_report = state["sentiment_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
+        market_research_report = state.get("market_report", "")
+        sentiment_report = state.get("sentiment_report", "")
+        news_report = state.get("news_report", "")
+        fundamentals_report = state.get("fundamentals_report", "")
 
-        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
-        past_memories = memory.get_memories(curr_situation, n_matches=2)
-
-        past_memory_str = ""
-        for i, rec in enumerate(past_memories, 1):
-            past_memory_str += rec["recommendation"] + "\n\n"
+        # Use Memory Broker outputs instead of per-node retrieval
+        past_preview = (
+            state.get("past_memories_preview")
+            or state.get("past_memories_str")
+        )
+        if not past_preview:
+            # Deterministic fallback if preview not present but structured memories exist
+            items = []
+            for i, rec in enumerate(state.get("past_memories") or [], 1):
+                rec_txt = (rec.get("recommendation") or "").strip()
+                score = rec.get("similarity_score")
+                if isinstance(score, (int, float)):
+                    score_str = f"{score:.3f}"
+                else:
+                    try:
+                        score_str = f"{float(score):.3f}"
+                    except (TypeError, ValueError):
+                        score_str = "NA"
+                items.append(f"- ID={i} | score={score_str} | {rec_txt}")
+            past_preview = "\n".join(items) if items else "No past memories found."
 
         prompt = f"""You are a Bull Analyst advocating for investing in the stock. Your task is to build a strong, evidence-based case emphasizing growth potential, competitive advantages, and positive market indicators. Leverage the provided research and data to address concerns and counter bearish arguments effectively.
 
@@ -3040,7 +3780,7 @@ Latest world affairs news: {news_report}
 Company fundamentals report: {fundamentals_report}
 Conversation history of the debate: {history}
 Last bear argument: {current_response}
-Reflections from similar situations and lessons learned: {past_memory_str}
+Reflections from similar situations and lessons learned (preview): {past_preview}
 Use this information to deliver a compelling bull argument, refute the bear's concerns, and engage in a dynamic debate that demonstrates the strengths of the bull position. You must also address reflections and learn from lessons and mistakes you made in the past.
 """
 
@@ -3053,12 +3793,112 @@ Use this information to deliver a compelling bull argument, refute the bear's co
             "bull_history": bull_history + "\n" + argument,
             "bear_history": investment_debate_state.get("bear_history", ""),
             "current_response": argument,
-            "count": investment_debate_state["count"] + 1,
+            "count": investment_debate_state.get("count", 0) + 1,
         }
 
         return {"investment_debate_state": new_investment_debate_state}
 
     return bull_node
+
+
+if __name__ == "__main__":
+    """
+    Lightweight self-tests for Bull Researcher.
+    Verifies:
+      1) Uses past_memories_preview when present (no fallback needed)
+      2) Falls back to state["past_memories"] when preview is absent
+      3) Gracefully handles no memories (prints friendly message)
+      4) Increments debate count and appends to history without KeyErrors when reports missing
+    Run:
+        python tradingagents/agents/researchers/bull_researcher.py
+    """
+    from types import SimpleNamespace
+
+    class DummyLLM:
+        def __init__(self):
+            self.calls = 0
+            self.last_prompt = None
+        def invoke(self, prompt):
+            self.calls += 1
+            self.last_prompt = prompt
+            return SimpleNamespace(content="BULL: OK")
+
+    def _mk_state(preview=None, memories=None, history="", count=0):
+        state = {
+            "investment_debate_state": {
+                "history": history,
+                "bull_history": "",
+                "bear_history": "",
+                "current_response": "",
+                "count": count,
+            },
+            # Reports may be empty; node should not crash
+            "market_report": "Market uptrend, revenue +12% YoY.",
+            "sentiment_report": "Improving.",
+            "news_report": "Beat EPS.",
+            "fundamentals_report": "Margins stable.",
+        }
+        if preview is not None:
+            state["past_memories_preview"] = preview
+        if memories is not None:
+            state["past_memories"] = memories
+        return state
+
+    print("\n[Test 1] Uses past_memories_preview when present (no fallback needed)")
+    llm = DummyLLM()
+    node = create_bull_researcher(llm, memory=None)
+    preview = "- ID=1 | score=0.900 | Raise allocation to leaders; watch rates."
+    out = node(_mk_state(preview=preview))
+    assert "investment_debate_state" in out
+    st = out["investment_debate_state"]
+    assert st.get("count", 0) == 1, "Count should increment from 0 to 1"
+    assert "Bull Analyst:" in st.get("history", ""), "History should include bull prefix"
+    assert preview in llm.last_prompt, "Prompt should include provided preview"
+    print("  ✓ Passed")
+
+    print("\n[Test 2] Falls back to state['past_memories'] when preview is absent")
+    llm2 = DummyLLM()
+    node2 = create_bull_researcher(llm2, memory=None)
+    memories = [
+        {"recommendation": "Trim duration; prefer cash-flow names.", "similarity_score": None},
+        {"recommendation": "Rotate to defensives if yields rise.", "similarity_score": 0.512},
+    ]
+    out2 = node2(_mk_state(preview=None, memories=memories, count=1))
+    st2 = out2["investment_debate_state"]
+    assert st2.get("count", 0) == 2, "Count should increment from 1 to 2"
+    # Fallback preview should render ID lines with scores ('NA' allowed for None)
+    assert "- ID=1" in llm2.last_prompt and "- ID=2" in llm2.last_prompt, "Fallback preview should list IDs"
+    print("  ✓ Passed")
+
+    print("\n[Test 3] Gracefully handles no memories (prints friendly message)")
+    llm3 = DummyLLM()
+    node3 = create_bull_researcher(llm3, memory=None)
+    out3 = node3(_mk_state(preview=None, memories=None, count=2))
+    st3 = out3["investment_debate_state"]
+    assert st3.get("count", 0) == 3, "Count should increment from 2 to 3"
+    assert "No past memories found" in llm3.last_prompt, "Prompt should include friendly no-memories message"
+    print("  ✓ Passed")
+
+    print("\n[Test 4] Increments debate count and appends to history without KeyErrors when reports missing")
+    llm4 = DummyLLM()
+    node4 = create_bull_researcher(llm4, memory=None)
+    state4 = {
+        "investment_debate_state": {
+            "history": "Initial history.",
+            "bull_history": "",
+            "bear_history": "",
+            "current_response": "",
+            "count": 5,
+        },
+        # Missing reports intentionally
+    }
+    out4 = node4(state4)
+    st4 = out4["investment_debate_state"]
+    assert st4.get("count", 0) == 6, "Count should increment from 5 to 6"
+    assert "Bull Analyst:" in st4.get("history", ""), "History should include bull prefix"
+    print("  ✓ Passed")
+
+    print("Bull Researcher self-tests passed.")
 
 ===== END OF FILE: ./tradingagents/agents/researchers/bull_researcher.py =====
 
@@ -3075,17 +3915,31 @@ def create_bear_researcher(llm, memory):
         bear_history = investment_debate_state.get("bear_history", "")
 
         current_response = investment_debate_state.get("current_response", "")
-        market_research_report = state["market_report"]
-        sentiment_report = state["sentiment_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
+        market_research_report = state.get("market_report", "")
+        sentiment_report = state.get("sentiment_report", "")
+        news_report = state.get("news_report", "")
+        fundamentals_report = state.get("fundamentals_report", "")
 
-        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
-        past_memories = memory.get_memories(curr_situation, n_matches=2)
-
-        past_memory_str = ""
-        for i, rec in enumerate(past_memories, 1):
-            past_memory_str += rec["recommendation"] + "\n\n"
+        # Use Memory Broker outputs instead of per-node retrieval
+        past_preview = (
+            state.get("past_memories_preview")
+            or state.get("past_memories_str")
+        )
+        if not past_preview:
+            # Deterministic fallback if preview not present but structured memories exist
+            items = []
+            for i, rec in enumerate(state.get("past_memories") or [], 1):
+                rec_txt = (rec.get("recommendation") or "").strip()
+                score = rec.get("similarity_score")
+                if isinstance(score, (int, float)):
+                    score_str = f"{score:.3f}"
+                else:
+                    try:
+                        score_str = f"{float(score):.3f}"
+                    except (TypeError, ValueError):
+                        score_str = "NA"
+                items.append(f"- ID={i} | score={score_str} | {rec_txt}")
+            past_preview = "\n".join(items) if items else "No past memories found."
 
         prompt = f"""You are a Bear Analyst making the case against investing in the stock. Your goal is to present a well-reasoned argument emphasizing risks, challenges, and negative indicators. Leverage the provided research and data to highlight potential downsides and counter bullish arguments effectively.
 
@@ -3105,7 +3959,7 @@ Latest world affairs news: {news_report}
 Company fundamentals report: {fundamentals_report}
 Conversation history of the debate: {history}
 Last bull argument: {current_response}
-Reflections from similar situations and lessons learned: {past_memory_str}
+Reflections from similar situations and lessons learned (preview): {past_preview}
 Use this information to deliver a compelling bear argument, refute the bull's claims, and engage in a dynamic debate that demonstrates the risks and weaknesses of investing in the stock. You must also address reflections and learn from lessons and mistakes you made in the past.
 """
 
@@ -3118,12 +3972,91 @@ Use this information to deliver a compelling bear argument, refute the bull's cl
             "bear_history": bear_history + "\n" + argument,
             "bull_history": investment_debate_state.get("bull_history", ""),
             "current_response": argument,
-            "count": investment_debate_state["count"] + 1,
+            "count": investment_debate_state.get("count", 0) + 1,
         }
 
         return {"investment_debate_state": new_investment_debate_state}
 
     return bear_node
+
+
+if __name__ == "__main__":
+    """
+    Lightweight self-tests for Bear Researcher.
+    Verifies:
+      1) Uses past_memories_preview when present
+      2) Falls back to state["past_memories"] when preview is absent
+      3) Gracefully handles no memories
+      4) Increments count and appends to history; robust when reports missing
+    Run:
+        python tradingagents/agents/researchers/bear_researcher.py
+    """
+    from types import SimpleNamespace
+
+    class DummyLLM:
+        def __init__(self):
+            self.calls = 0
+            self.last_prompt = None
+        def invoke(self, prompt):
+            self.calls += 1
+            self.last_prompt = prompt
+            return SimpleNamespace(content="BEAR: OK")
+
+    def _mk_state(preview=None, memories=None, history="", count=0):
+        state = {
+            "investment_debate_state": {
+                "history": history,
+                "bear_history": "",
+                "bull_history": "",
+                "current_response": "",
+                "count": count,
+            },
+            # Reports may be empty; node should not crash
+            "market_report": "Market risk rising, revenue slowing.",
+            "sentiment_report": "Mixed.",
+            "news_report": "Regulatory headwinds.",
+            "fundamentals_report": "Cash burn elevated.",
+        }
+        if preview is not None:
+            state["past_memories_preview"] = preview
+        if memories is not None:
+            state["past_memories"] = memories
+        return state
+
+    print("\n[Test 1] Uses past_memories_preview when present")
+    llm = DummyLLM()
+    node = create_bear_researcher(llm, memory=None)
+    preview = "- ID=1 | score=0.420 | Cut exposure; rising yields pressure valuations."
+    out = node(_mk_state(preview=preview))
+    st = out["investment_debate_state"]
+    assert st.get("count", 0) == 1, "Count should increment from 0 to 1"
+    assert "Bear Analyst:" in st.get("history", ""), "History should include bear prefix"
+    assert preview in llm.last_prompt, "Prompt should include provided preview"
+    print("  ✓ Passed")
+
+    print("\n[Test 2] Fallback preview from memories when preview is absent")
+    llm2 = DummyLLM()
+    node2 = create_bear_researcher(llm2, memory=None)
+    memories = [
+        {"recommendation": "Avoid high beta; hedge with puts.", "similarity_score": 0.333},
+        {"recommendation": "Shift to quality balance sheets.", "similarity_score": None},
+    ]
+    out2 = node2(_mk_state(preview=None, memories=memories, count=1))
+    st2 = out2["investment_debate_state"]
+    assert st2.get("count", 0) == 2, "Count should increment from 1 to 2"
+    assert "- ID=1" in llm2.last_prompt and "- ID=2" in llm2.last_prompt, "Fallback preview should list IDs"
+    print("  ✓ Passed")
+
+    print("\n[Test 3] No preview and no memories -> friendly message in prompt")
+    llm3 = DummyLLM()
+    node3 = create_bear_researcher(llm3, memory=None)
+    out3 = node3(_mk_state(preview=None, memories=None, count=2))
+    st3 = out3["investment_debate_state"]
+    assert st3.get("count", 0) == 3, "Count should increment from 2 to 3"
+    assert "No past memories found" in llm3.last_prompt, "Prompt should include friendly no-memories message"
+    print("  ✓ Passed")
+
+    print("Bear Researcher self-tests passed.")
 
 ===== END OF FILE: ./tradingagents/agents/researchers/bear_researcher.py =====
 
@@ -3135,33 +4068,55 @@ import json
 
 def create_safe_debator(llm):
     def safe_node(state) -> dict:
-        risk_debate_state = state["risk_debate_state"]
+        risk_debate_state = state.get("risk_debate_state", {})
         history = risk_debate_state.get("history", "")
         safe_history = risk_debate_state.get("safe_history", "")
 
         current_risky_response = risk_debate_state.get("current_risky_response", "")
         current_neutral_response = risk_debate_state.get("current_neutral_response", "")
 
-        market_research_report = state["market_report"]
-        sentiment_report = state["sentiment_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
+        market_research_report = state.get("market_report", "")
+        sentiment_report = state.get("sentiment_report", "")
+        news_report = state.get("news_report", "")
+        fundamentals_report = state.get("fundamentals_report", "")
 
-        trader_decision = state["trader_investment_plan"]
+        trader_decision = state.get("trader_investment_plan", "")
+
+        past_preview = state.get("past_memories_preview") or state.get("past_memories_str")
+        if not past_preview:
+            items = []
+            for i, rec in enumerate(state.get("past_memories") or [], 1):
+                rec_txt = (rec.get("recommendation") or "").strip()
+                score = rec.get("similarity_score")
+                if isinstance(score, (int, float)):
+                    score_str = f"{score:.3f}"
+                else:
+                    try:
+                        score_str = f"{float(score):.3f}"
+                    except (TypeError, ValueError):
+                        score_str = "NA"
+                items.append(f"- ID={i} | score={score_str} | {rec_txt}")
+            past_preview = "\n".join(items) if items else "No past memories found."
 
         prompt = f"""As the Safe/Conservative Risk Analyst, your primary objective is to protect assets, minimize volatility, and ensure steady, reliable growth. You prioritize stability, security, and risk mitigation, carefully assessing potential losses, economic downturns, and market volatility. When evaluating the trader's decision or plan, critically examine high-risk elements, pointing out where the decision may expose the firm to undue risk and where more cautious alternatives could secure long-term gains. Here is the trader's decision:
 
 {trader_decision}
 
+Past reflections (preview):
+{past_preview}
+
 Your task is to actively counter the arguments of the Risky and Neutral Analysts, highlighting where their views may overlook potential threats or fail to prioritize sustainability. Respond directly to their points, drawing from the following data sources to build a convincing case for a low-risk approach adjustment to the trader's decision:
+- Market: {market_research_report}
+- Sentiment: {sentiment_report}
+- News: {news_report}
+- Fundamentals: {fundamentals_report}
 
-Market Research Report: {market_research_report}
-Social Media Sentiment Report: {sentiment_report}
-Latest World Affairs Report: {news_report}
-Company Fundamentals Report: {fundamentals_report}
-Here is the current conversation history: {history} Here is the last response from the risky analyst: {current_risky_response} Here is the last response from the neutral analyst: {current_neutral_response}. If there are no responses from the other viewpoints, do not halluncinate and just present your point.
+Conversation history: {history}
+Last from Risky: {current_risky_response}
+Last from Neutral: {current_neutral_response}
+(If there are no responses from the other viewpoints, do not hallucinate; just present your point.)
 
-Engage by questioning their optimism and emphasizing the potential downsides they may have overlooked. Address each of their counterpoints to showcase why a conservative stance is ultimately the safest path for the firm's assets. Focus on debating and critiquing their arguments to demonstrate the strength of a low-risk strategy over their approaches. Output conversationally as if you are speaking without any special formatting."""
+Engage by questioning their optimism and emphasizing the potential downsides they may have overlooked. Address each of their counterpoints to showcase why a conservative stance is ultimately the safest path for the firm's assets. Focus on debating and critiquing their arguments to demonstrate the strength of a low-risk strategy over their approaches. Output conversationally without special formatting."""
 
         response = llm.invoke(prompt)
 
@@ -3180,12 +4135,84 @@ Engage by questioning their optimism and emphasizing the potential downsides the
             "current_neutral_response": risk_debate_state.get(
                 "current_neutral_response", ""
             ),
-            "count": risk_debate_state["count"] + 1,
+            "count": risk_debate_state.get("count", 0) + 1,
         }
 
         return {"risk_debate_state": new_risk_debate_state}
 
     return safe_node
+
+
+if __name__ == "__main__":
+    """
+    Self-tests for Safe/Conservative Debator.
+    Verifies preview usage, fallback, no-memory path, and robust count/history.
+    Run: python tradingagents/agents/risk_mgmt/conservative_debator.py
+    """
+    from types import SimpleNamespace
+
+    class DummyLLM:
+        def __init__(self):
+            self.calls = 0
+            self.last_prompt = None
+        def invoke(self, prompt):
+            self.calls += 1
+            self.last_prompt = prompt
+            return SimpleNamespace(content="SAFE: ok")
+
+    def _mk_state(preview=None, memories=None, count=0):
+        st = {
+            "risk_debate_state": {
+                "history": "",
+                "risky_history": "",
+                "safe_history": "",
+                "neutral_history": "",
+                "current_risky_response": "",
+                "current_safe_response": "",
+                "current_neutral_response": "",
+                "count": count,
+            },
+            "trader_investment_plan": "Reduce risk; tighten stops.",
+            "market_report": "Choppy.",
+            "sentiment_report": "Cautious.",
+            "news_report": "Mixed data.",
+            "fundamentals_report": "Decent balance sheet.",
+        }
+        if preview is not None:
+            st["past_memories_preview"] = preview
+        if memories is not None:
+            st["past_memories"] = memories
+        return st
+
+    print("\n[Test 1] Uses preview when present")
+    llm1 = DummyLLM()
+    node1 = create_safe_debator(llm1)
+    prev1 = "- ID=1 | score=0.72 | Prior drawdowns avoided by cutting risk early during volatility spikes."
+    out1 = node1(_mk_state(preview=prev1))
+    assert "SAFE:" in out1["risk_debate_state"]["current_safe_response"], "Should include model content"
+    assert prev1 in llm1.last_prompt, "Preview must be in prompt"
+    assert out1["risk_debate_state"].get("count", 0) == 1
+    print("  ✓ Passed")
+
+    print("\n[Test 2] Fallback to past_memories list when no preview")
+    llm2 = DummyLLM()
+    node2 = create_safe_debator(llm2)
+    mems = [
+        {"recommendation": "Cut position size; raise stops.", "similarity_score": 0.41},
+        {"recommendation": "Favor defensives; avoid leverage.", "similarity_score": None},
+    ]
+    out2 = node2(_mk_state(preview=None, memories=mems, count=3))
+    assert "- ID=1" in llm2.last_prompt and "- ID=2" in llm2.last_prompt
+    assert out2["risk_debate_state"].get("count", 0) == 4
+    print("  ✓ Passed")
+
+    print("\n[Test 3] No memories -> friendly message")
+    llm3 = DummyLLM()
+    node3 = create_safe_debator(llm3)
+    out3 = node3(_mk_state(preview=None, memories=None, count=2))
+    assert "No past memories found" in llm3.last_prompt
+    assert out3["risk_debate_state"].get("count", 0) == 3
+    print("  ✓ Passed\n")
 
 ===== END OF FILE: ./tradingagents/agents/risk_mgmt/conservative_debator.py =====
 
@@ -3196,33 +4223,55 @@ import json
 
 def create_neutral_debator(llm):
     def neutral_node(state) -> dict:
-        risk_debate_state = state["risk_debate_state"]
+        risk_debate_state = state.get("risk_debate_state", {})
         history = risk_debate_state.get("history", "")
         neutral_history = risk_debate_state.get("neutral_history", "")
 
         current_risky_response = risk_debate_state.get("current_risky_response", "")
         current_safe_response = risk_debate_state.get("current_safe_response", "")
 
-        market_research_report = state["market_report"]
-        sentiment_report = state["sentiment_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
+        market_research_report = state.get("market_report", "")
+        sentiment_report = state.get("sentiment_report", "")
+        news_report = state.get("news_report", "")
+        fundamentals_report = state.get("fundamentals_report", "")
 
-        trader_decision = state["trader_investment_plan"]
+        trader_decision = state.get("trader_investment_plan", "")
 
-        prompt = f"""As the Neutral Risk Analyst, your role is to provide a balanced perspective, weighing both the potential benefits and risks of the trader's decision or plan. You prioritize a well-rounded approach, evaluating the upsides and downsides while factoring in broader market trends, potential economic shifts, and diversification strategies.Here is the trader's decision:
+        past_preview = state.get("past_memories_preview") or state.get("past_memories_str")
+        if not past_preview:
+            items = []
+            for i, rec in enumerate(state.get("past_memories") or [], 1):
+                rec_txt = (rec.get("recommendation") or "").strip()
+                score = rec.get("similarity_score")
+                if isinstance(score, (int, float)):
+                    score_str = f"{score:.3f}"
+                else:
+                    try:
+                        score_str = f"{float(score):.3f}"
+                    except (TypeError, ValueError):
+                        score_str = "NA"
+                items.append(f"- ID={i} | score={score_str} | {rec_txt}")
+            past_preview = "\n".join(items) if items else "No past memories found."
+
+        prompt = f"""As the Neutral Risk Analyst, your role is to provide a balanced perspective, weighing both the potential benefits and risks of the trader's decision or plan. You prioritize a well-rounded approach, evaluating the upsides and downsides while factoring in broader market trends, potential economic shifts, and diversification strategies. Here is the trader's decision:
 
 {trader_decision}
 
-Your task is to challenge both the Risky and Safe Analysts, pointing out where each perspective may be overly optimistic or overly cautious. Use insights from the following data sources to support a moderate, sustainable strategy to adjust the trader's decision:
+Past reflections (preview):
+{past_preview}
 
-Market Research Report: {market_research_report}
-Social Media Sentiment Report: {sentiment_report}
-Latest World Affairs Report: {news_report}
-Company Fundamentals Report: {fundamentals_report}
-Here is the current conversation history: {history} Here is the last response from the risky analyst: {current_risky_response} Here is the last response from the safe analyst: {current_safe_response}. If there are no responses from the other viewpoints, do not halluncinate and just present your point.
+Use insights from the following data sources to support a moderate, sustainable strategy to adjust the trader's decision:
+- Market: {market_research_report}
+- Sentiment: {sentiment_report}
+- News: {news_report}
+- Fundamentals: {fundamentals_report}
 
-Engage actively by analyzing both sides critically, addressing weaknesses in the risky and conservative arguments to advocate for a more balanced approach. Challenge each of their points to illustrate why a moderate risk strategy might offer the best of both worlds, providing growth potential while safeguarding against extreme volatility. Focus on debating rather than simply presenting data, aiming to show that a balanced view can lead to the most reliable outcomes. Output conversationally as if you are speaking without any special formatting."""
+Conversation history: {history}
+Last from Risky: {current_risky_response}
+Last from Safe: {current_safe_response}
+(If there are no responses from the other viewpoints, do not hallucinate; just present your point.)
+
+Engage actively by analyzing both sides critically, addressing weaknesses in the risky and conservative arguments to advocate for a more balanced approach. Challenge each of their points to illustrate why a moderate risk strategy might offer the best of both worlds, providing growth potential while safeguarding against extreme volatility. Output conversationally without special formatting."""
 
         response = llm.invoke(prompt)
 
@@ -3239,12 +4288,85 @@ Engage actively by analyzing both sides critically, addressing weaknesses in the
             ),
             "current_safe_response": risk_debate_state.get("current_safe_response", ""),
             "current_neutral_response": argument,
-            "count": risk_debate_state["count"] + 1,
+            "count": risk_debate_state.get("count", 0) + 1,
         }
 
         return {"risk_debate_state": new_risk_debate_state}
 
     return neutral_node
+
+
+if __name__ == "__main__":
+    """
+    Self-tests for Neutral Debator.
+    Verifies preview usage, fallback, no-memory path, and robust count/history.
+    Run: python tradingagents/agents/risk_mgmt/neutral_debator.py
+    """
+    from types import SimpleNamespace
+
+    class DummyLLM:
+        def __init__(self):
+            self.calls = 0
+            self.last_prompt = None
+        def invoke(self, prompt):
+            self.calls += 1
+            self.last_prompt = prompt
+            return SimpleNamespace(content="NEUTRAL: ok")
+
+    def _mk_state(preview=None, memories=None, count=0):
+        st = {
+            "risk_debate_state": {
+                "history": "",
+                "risky_history": "",
+                "safe_history": "",
+                "neutral_history": "",
+                "current_risky_response": "",
+                "current_safe_response": "",
+                "current_neutral_response": "",
+                "count": count,
+            },
+            "trader_investment_plan": "Blend momentum with risk controls.",
+            "market_report": "Range-bound.",
+            "sentiment_report": "Mixed.",
+            "news_report": "In-line.",
+            "fundamentals_report": "Stable.",
+        }
+        if preview is not None:
+            st["past_memories_preview"] = preview
+        if memories is not None:
+            st["past_memories"] = memories
+            
+        return st
+
+    print("\n[Test 1] Uses preview when present")
+    llm1 = DummyLLM()
+    node1 = create_neutral_debator(llm1)
+    prev1 = "- ID=1 | score=0.60 | Blended strategy worked when volatility was moderate."
+    out1 = node1(_mk_state(preview=prev1))
+    assert "NEUTRAL:" in out1["risk_debate_state"]["current_neutral_response"]
+    assert prev1 in llm1.last_prompt
+    assert out1["risk_debate_state"].get("count", 0) == 1
+    print("  ✓ Passed")
+
+    print("\n[Test 2] Fallback to past_memories list when no preview")
+    llm2 = DummyLLM()
+    node2 = create_neutral_debator(llm2)
+    mems = [
+        {"recommendation": "Hedge tail risk; keep dry powder.", "similarity_score": 0.45},
+        {"recommendation": "Diversify across factors.", "similarity_score": None},
+    ]
+    out2 = node2(_mk_state(preview=None, memories=mems, count=5))
+    assert "- ID=1" in llm2.last_prompt and "- ID=2" in llm2.last_prompt
+    assert out2["risk_debate_state"].get("count", 0) == 6
+    print("  ✓ Passed")
+
+    print("\n[Test 3] No memories -> friendly message")
+    llm3 = DummyLLM()
+    node3 = create_neutral_debator(llm3)
+    out3 = node3(_mk_state(preview=None, memories=None, count=2))
+    assert "No past memories found" in llm3.last_prompt
+    assert out3["risk_debate_state"].get("count", 0) == 3
+    print("  ✓ Passed\n")
 
 ===== END OF FILE: ./tradingagents/agents/risk_mgmt/neutral_debator.py =====
 
@@ -3255,33 +4377,56 @@ import json
 
 def create_risky_debator(llm):
     def risky_node(state) -> dict:
-        risk_debate_state = state["risk_debate_state"]
+        risk_debate_state = state.get("risk_debate_state", {})
         history = risk_debate_state.get("history", "")
         risky_history = risk_debate_state.get("risky_history", "")
 
         current_safe_response = risk_debate_state.get("current_safe_response", "")
         current_neutral_response = risk_debate_state.get("current_neutral_response", "")
 
-        market_research_report = state["market_report"]
-        sentiment_report = state["sentiment_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
+        market_research_report = state.get("market_report", "")
+        sentiment_report = state.get("sentiment_report", "")
+        news_report = state.get("news_report", "")
+        fundamentals_report = state.get("fundamentals_report", "")
 
-        trader_decision = state["trader_investment_plan"]
+        trader_decision = state.get("trader_investment_plan", "")
+
+        # Memory Broker preview (or deterministic fallback)
+        past_preview = state.get("past_memories_preview") or state.get("past_memories_str")
+        if not past_preview:
+            items = []
+            for i, rec in enumerate(state.get("past_memories") or [], 1):
+                rec_txt = (rec.get("recommendation") or "").strip()
+                score = rec.get("similarity_score")
+                if isinstance(score, (int, float)):
+                    score_str = f"{score:.3f}"
+                else:
+                    try:
+                        score_str = f"{float(score):.3f}"
+                    except (TypeError, ValueError):
+                        score_str = "NA"
+                items.append(f"- ID={i} | score={score_str} | {rec_txt}")
+            past_preview = "\n".join(items) if items else "No past memories found."
 
         prompt = f"""As the Risky Risk Analyst, your role is to actively champion high-reward, high-risk opportunities, emphasizing bold strategies and competitive advantages. When evaluating the trader's decision or plan, focus intently on the potential upside, growth potential, and innovative benefits—even when these come with elevated risk. Use the provided market data and sentiment analysis to strengthen your arguments and challenge the opposing views. Specifically, respond directly to each point made by the conservative and neutral analysts, countering with data-driven rebuttals and persuasive reasoning. Highlight where their caution might miss critical opportunities or where their assumptions may be overly conservative. Here is the trader's decision:
 
 {trader_decision}
 
-Your task is to create a compelling case for the trader's decision by questioning and critiquing the conservative and neutral stances to demonstrate why your high-reward perspective offers the best path forward. Incorporate insights from the following sources into your arguments:
+Past reflections (preview):
+{past_preview}
 
-Market Research Report: {market_research_report}
-Social Media Sentiment Report: {sentiment_report}
-Latest World Affairs Report: {news_report}
-Company Fundamentals Report: {fundamentals_report}
-Here is the current conversation history: {history} Here are the last arguments from the conservative analyst: {current_safe_response} Here are the last arguments from the neutral analyst: {current_neutral_response}. If there are no responses from the other viewpoints, do not halluncinate and just present your point.
+Incorporate insights from the following sources into your arguments:
+- Market: {market_research_report}
+- Sentiment: {sentiment_report}
+- News: {news_report}
+- Fundamentals: {fundamentals_report}
 
-Engage actively by addressing any specific concerns raised, refuting the weaknesses in their logic, and asserting the benefits of risk-taking to outpace market norms. Maintain a focus on debating and persuading, not just presenting data. Challenge each counterpoint to underscore why a high-risk approach is optimal. Output conversationally as if you are speaking without any special formatting."""
+Conversation history: {history}
+Last from Safe: {current_safe_response}
+Last from Neutral: {current_neutral_response}
+(If there are no responses from the other viewpoints, do not hallucinate; just present your point.)
+
+Engage actively by addressing any specific concerns raised, refuting the weaknesses in their logic, and asserting the benefits of risk-taking to outpace market norms. Maintain a focus on debating and persuading, not just presenting data. Challenge each counterpoint to underscore why a high-risk approach is optimal. Output conversationally without special formatting."""
 
         response = llm.invoke(prompt)
 
@@ -3298,12 +4443,84 @@ Engage actively by addressing any specific concerns raised, refuting the weaknes
             "current_neutral_response": risk_debate_state.get(
                 "current_neutral_response", ""
             ),
-            "count": risk_debate_state["count"] + 1,
+            "count": risk_debate_state.get("count", 0) + 1,
         }
 
         return {"risk_debate_state": new_risk_debate_state}
 
     return risky_node
+
+
+if __name__ == "__main__":
+    """
+    Self-tests for Risky Debator.
+    Verifies preview usage, fallback, no-memory path, and robust count/history.
+    Run: python tradingagents/agents/risk_mgmt/aggresive_debator.py
+    """
+    from types import SimpleNamespace
+
+    class DummyLLM:
+        def __init__(self):
+            self.calls = 0
+            self.last_prompt = None
+        def invoke(self, prompt):
+            self.calls += 1
+            self.last_prompt = prompt
+            return SimpleNamespace(content="RISKY: ok")
+
+    def _mk_state(preview=None, memories=None, count=0):
+        st = {
+            "risk_debate_state": {
+                "history": "",
+                "risky_history": "",
+                "safe_history": "",
+                "neutral_history": "",
+                "current_risky_response": "",
+                "current_safe_response": "",
+                "current_neutral_response": "",
+                "count": count,
+            },
+            "trader_investment_plan": "Enter aggressively on momentum.",
+            "market_report": "Uptrend.",
+            "sentiment_report": "Bullish.",
+            "news_report": "Strong guide.",
+            "fundamentals_report": "Growing margins.",
+        }
+        if preview is not None:
+            st["past_memories_preview"] = preview
+        if memories is not None:
+            st["past_memories"] = memories
+        return st
+
+    print("\n[Test 1] Uses preview when present")
+    llm1 = DummyLLM()
+    node1 = create_risky_debator(llm1)
+    prev1 = "- ID=1 | score=0.80 | Prior success with momentum entries when liquidity strong."
+    out1 = node1(_mk_state(preview=prev1))
+    assert "RISKY:" in out1["risk_debate_state"]["current_risky_response"], "Should include model content"
+    assert prev1 in llm1.last_prompt, "Preview must be in prompt"
+    assert out1["risk_debate_state"].get("count", 0) == 1
+    print("  ✓ Passed")
+
+    print("\n[Test 2] Fallback to past_memories list when no preview")
+    llm2 = DummyLLM()
+    node2 = create_risky_debator(llm2)
+    mems = [
+        {"recommendation": "Press winners; keep tight trailing stops.", "similarity_score": 0.51},
+        {"recommendation": "Scale in on breakouts.", "similarity_score": None},
+    ]
+    out2 = node2(_mk_state(preview=None, memories=mems, count=1))
+    assert "- ID=1" in llm2.last_prompt and "- ID=2" in llm2.last_prompt
+    assert out2["risk_debate_state"].get("count", 0) == 2
+    print("  ✓ Passed")
+
+    print("\n[Test 3] No memories -> friendly message")
+    llm3 = DummyLLM()
+    node3 = create_risky_debator(llm3)
+    out3 = node3(_mk_state(preview=None, memories=None, count=2))
+    assert "No past memories found" in llm3.last_prompt
+    assert out3["risk_debate_state"].get("count", 0) == 3
+    print("  ✓ Passed\n")
 
 ===== END OF FILE: ./tradingagents/agents/risk_mgmt/aggresive_debator.py =====
 
@@ -3315,22 +4532,32 @@ import json
 
 def create_trader(llm, memory):
     def trader_node(state, name):
-        company_name = state["company_of_interest"]
-        investment_plan = state["investment_plan"]
-        market_research_report = state["market_report"]
-        sentiment_report = state["sentiment_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
+        company_name = state.get("company_of_interest", "Unknown Company")
+        investment_plan = state.get("investment_plan", "")
+        market_research_report = state.get("market_report", "")
+        sentiment_report = state.get("sentiment_report", "")
+        news_report = state.get("news_report", "")
+        fundamentals_report = state.get("fundamentals_report", "")
 
-        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
-        past_memories = memory.get_memories(curr_situation, n_matches=2)
-
-        past_memory_str = ""
-        if past_memories:
-            for i, rec in enumerate(past_memories, 1):
-                past_memory_str += rec["recommendation"] + "\n\n"
-        else:
-            past_memory_str = "No past memories found."
+        # Use Memory Broker outputs
+        past_preview = (
+            state.get("past_memories_preview")
+            or state.get("past_memories_str")
+        )
+        if not past_preview:
+            items = []
+            for i, rec in enumerate(state.get("past_memories") or [], 1):
+                rec_txt = (rec.get("recommendation") or "").strip()
+                score = rec.get("similarity_score")
+                if isinstance(score, (int, float)):
+                    score_str = f"{score:.3f}"
+                else:
+                    try:
+                        score_str = f"{float(score):.3f}"
+                    except (TypeError, ValueError):
+                        score_str = "NA"
+                items.append(f"- ID={i} | score={score_str} | {rec_txt}")
+            past_preview = "\n".join(items) if items else "No past memories found."
 
         context = {
             "role": "user",
@@ -3340,7 +4567,17 @@ def create_trader(llm, memory):
         messages = [
             {
                 "role": "system",
-                "content": f"""You are a trading agent analyzing market data to make investment decisions. Based on your analysis, provide a specific recommendation to buy, sell, or hold. End with a firm decision and always conclude your response with 'FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**' to confirm your recommendation. Do not forget to utilize lessons from past decisions to learn from your mistakes. Here is some reflections from similar situatiosn you traded in and the lessons learned: {past_memory_str}""",
+                "content": f"""You are a trading agent analyzing market data to make investment decisions. Provide a specific recommendation to buy, sell, or hold. End with a firm decision and always conclude your response with 'FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**'. Incorporate lessons from prior similar situations to avoid repeat mistakes.
+
+Past reflections (preview):
+{past_preview}
+
+Reference analyst inputs:
+- Market: {market_research_report}
+- Sentiment: {sentiment_report}
+- News: {news_report}
+- Fundamentals: {fundamentals_report}
+""",
             },
             context,
         ]
@@ -3354,6 +4591,78 @@ def create_trader(llm, memory):
         }
 
     return functools.partial(trader_node, name="Trader")
+
+
+if __name__ == "__main__":
+    """
+    Lightweight self-tests for Trader.
+    Verifies:
+      1) Uses past_memories_preview when present
+      2) Falls back to state["past_memories"] when preview is absent
+      3) Gracefully handles no memories
+      4) Produces a 'messages' list and 'trader_investment_plan'
+    Run:
+        python tradingagents/agents/trader/trader.py
+    """
+    from types import SimpleNamespace
+
+    class DummyLLM:
+        def __init__(self):
+            self.calls = 0
+            self.last_messages = None
+        def invoke(self, messages):
+            self.calls += 1
+            self.last_messages = messages
+            return SimpleNamespace(content="TRADER: FINAL TRANSACTION PROPOSAL: **BUY**")
+
+    def _mk_state(preview=None, memories=None):
+        st = {
+            "company_of_interest": "ACME",
+            "investment_plan": "Buy on pullbacks; scale in.",
+            "market_report": "Trend up.",
+            "sentiment_report": "Positive.",
+            "news_report": "Beats.",
+            "fundamentals_report": "Cash flow strong.",
+        }
+        if preview is not None:
+            st["past_memories_preview"] = preview
+        if memories is not None:
+            st["past_memories"] = memories
+        return st
+
+    print("\n[Test 1] Uses preview when present")
+    llm1 = DummyLLM()
+    node1 = create_trader(llm1, memory=None)
+    prev1 = "- ID=1 | score=0.88 | Prior stop-loss too loose; tighten."
+    out1 = node1(_mk_state(preview=prev1))
+    assert isinstance(out1.get("messages"), list) and out1["messages"], "Should return messages list"
+    assert out1.get("trader_investment_plan", "").startswith("TRADER:"), "Should forward LLM content"
+    # inspect last prompt
+    system_msg = llm1.last_messages[0]["content"]
+    assert prev1 in system_msg
+    print("  ✓ Passed")
+
+    print("\n[Test 2] Fallback to past_memories when no preview")
+    llm2 = DummyLLM()
+    node2 = create_trader(llm2, memory=None)
+    mems = [
+        {"recommendation": "Hedge with puts.", "similarity_score": 0.333},
+        {"recommendation": "Shift to quality.", "similarity_score": None},
+    ]
+    out2 = node2(_mk_state(preview=None, memories=mems))
+    system_msg2 = llm2.last_messages[0]["content"]
+    assert "- ID=1" in system_msg2 and "- ID=2" in system_msg2
+    print("  ✓ Passed")
+
+    print("\n[Test 3] No memories -> friendly message")
+    llm3 = DummyLLM()
+    node3 = create_trader(llm3, memory=None)
+    out3 = node3(_mk_state(preview=None, memories=None))
+    system_msg3 = llm3.last_messages[0]["content"]
+    assert "No past memories found" in system_msg3
+    print("  ✓ Passed")
+
+    print("\nTrader self-tests passed.\n")
 
 ===== END OF FILE: ./tradingagents/agents/trader/trader.py =====
 
@@ -3434,20 +4743,33 @@ import json
 
 def create_research_manager(llm, memory):
     def research_manager_node(state) -> dict:
-        history = state["investment_debate_state"].get("history", "")
-        market_research_report = state["market_report"]
-        sentiment_report = state["sentiment_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
+        investment_debate_state = state.get("investment_debate_state", {})
+        history = investment_debate_state.get("history", "")
+        market_research_report = state.get("market_report", "")
+        sentiment_report = state.get("sentiment_report", "")
+        news_report = state.get("news_report", "")
+        fundamentals_report = state.get("fundamentals_report", "")
 
-        investment_debate_state = state["investment_debate_state"]
-
-        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
-        past_memories = memory.get_memories(curr_situation, n_matches=2)
-
-        past_memory_str = ""
-        for i, rec in enumerate(past_memories, 1):
-            past_memory_str += rec["recommendation"] + "\n\n"
+        # Use Memory Broker outputs instead of per-node retrieval
+        past_preview = (
+            state.get("past_memories_preview")
+            or state.get("past_memories_str")
+        )
+        if not past_preview:
+            # Deterministic fallback if preview not present but structured memories exist
+            items = []
+            for i, rec in enumerate(state.get("past_memories") or [], 1):
+                rec_txt = (rec.get("recommendation") or "").strip()
+                score = rec.get("similarity_score")
+                if isinstance(score, (int, float)):
+                    score_str = f"{score:.3f}"
+                else:
+                    try:
+                        score_str = f"{float(score):.3f}"
+                    except (TypeError, ValueError):
+                        score_str = "NA"
+                items.append(f"- ID={i} | score={score_str} | {rec_txt}")
+            past_preview = "\n".join(items) if items else "No past memories found."
 
         prompt = f"""As the portfolio manager and debate facilitator, your role is to critically evaluate this round of debate and make a definitive decision: align with the bear analyst, the bull analyst, or choose Hold only if it is strongly justified based on the arguments presented.
 
@@ -3458,14 +4780,21 @@ Additionally, develop a detailed investment plan for the trader. This should inc
 Your Recommendation: A decisive stance supported by the most convincing arguments.
 Rationale: An explanation of why these arguments lead to your conclusion.
 Strategic Actions: Concrete steps for implementing the recommendation.
-Take into account your past mistakes on similar situations. Use these insights to refine your decision-making and ensure you are learning and improving. Present your analysis conversationally, as if speaking naturally, without special formatting. 
 
-Here are your past reflections on mistakes:
-\"{past_memory_str}\"
+Use lessons from prior, similar situations to avoid repeating mistakes.
 
-Here is the debate:
+Past reflections (preview):
+{past_preview}
+
+Reference analyst inputs:
+- Market: {market_research_report}
+- Sentiment: {sentiment_report}
+- News: {news_report}
+- Fundamentals: {fundamentals_report}
+
 Debate History:
-{history}"""
+{history}
+"""
         response = llm.invoke(prompt)
 
         new_investment_debate_state = {
@@ -3474,7 +4803,7 @@ Debate History:
             "bear_history": investment_debate_state.get("bear_history", ""),
             "bull_history": investment_debate_state.get("bull_history", ""),
             "current_response": response.content,
-            "count": investment_debate_state["count"],
+            "count": investment_debate_state.get("count", 0),
         }
 
         return {
@@ -3484,12 +4813,92 @@ Debate History:
 
     return research_manager_node
 
+
+if __name__ == "__main__":
+    """
+    Lightweight self-tests for Research Manager.
+    Verifies:
+      1) Uses past_memories_preview when present
+      2) Falls back to state["past_memories"] when preview is absent
+      3) Gracefully handles no memories
+      4) Preserves/increments debate state fields robustly
+    Run:
+        python tradingagents/agents/managers/research_manager.py
+    """
+    from types import SimpleNamespace
+
+    class DummyLLM:
+        def __init__(self, tag):
+            self.tag = tag
+            self.calls = 0
+            self.last_prompt = None
+        def invoke(self, prompt):
+            self.calls += 1
+            self.last_prompt = prompt
+            return SimpleNamespace(content=f"{self.tag}: DECISION=BUY")
+
+    def _mk_state(preview=None, memories=None, history="", count=0):
+        st = {
+            "investment_debate_state": {
+                "history": history,
+                "bear_history": "",
+                "bull_history": "",
+                "current_response": "",
+                "count": count,
+            },
+            "market_report": "Market steady.",
+            "sentiment_report": "Neutral.",
+            "news_report": "Inline.",
+            "fundamentals_report": "Solid margins.",
+        }
+        if preview is not None:
+            st["past_memories_preview"] = preview
+        if memories is not None:
+            st["past_memories"] = memories
+        return st
+
+    print("\n[Test 1] Uses preview when present")
+    llm1 = DummyLLM("RM1")
+    node1 = create_research_manager(llm1, memory=None)
+    prev1 = "- ID=1 | score=0.88 | Prior miss due to ignoring liquidity risk; include stop-loss."
+    out1 = node1(_mk_state(preview=prev1, count=0))
+    assert out1["investment_plan"].startswith("RM1"), "LLM output should flow through"
+    assert prev1 in llm1.last_prompt, "Prompt should include preview"
+    print("  ✓ Passed")
+
+    print("\n[Test 2] Fallback to past_memories when no preview")
+    llm2 = DummyLLM("RM2")
+    node2 = create_research_manager(llm2, memory=None)
+    mems = [
+        {"recommendation": "Avoid leverage; maintain cash buffer.", "similarity_score": 0.42},
+        {"recommendation": "Rotate to defensives on rising yields.", "similarity_score": None},
+    ]
+    out2 = node2(_mk_state(preview=None, memories=mems, count=3))
+    assert "- ID=1" in llm2.last_prompt and "- ID=2" in llm2.last_prompt, "Fallback should render ID list"
+    assert out2["investment_debate_state"].get("count", 0) == 3
+    print("  ✓ Passed")
+
+    print("\n[Test 3] No memories -> friendly message")
+    llm3 = DummyLLM("RM3")
+    node3 = create_research_manager(llm3, memory=None)
+    out3 = node3(_mk_state(preview=None, memories=None, count=5))
+    assert "No past memories found" in llm3.last_prompt
+    print("  ✓ Passed")
+
+    print("\nResearch Manager self-tests passed.\n")
+
 ===== END OF FILE: ./tradingagents/agents/managers/research_manager.py =====
 
 ===== FILE: ./tradingagents/agents/utils/memory.py =====
 import numpy as np
+import hashlib
+import threading
+from collections import OrderedDict
+from typing import List, Tuple
+
 try:
     import tiktoken
+
     _TIKTOKEN_AVAILABLE = True
 except Exception:
     _TIKTOKEN_AVAILABLE = False
@@ -3502,6 +4911,8 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 # Safe embedding chunking for models with ~8k token limits
 _EMBED_MAX_TOKENS = 8000  # keep a little headroom under 8192
+_CACHE_MAX = 512  # max cached embeddings per process
+_NORM_VER = "v1"  # bump when normalization logic changes
 
 
 def _get_tokenizer():
@@ -3520,106 +4931,201 @@ def _count_tokens(text: str) -> int:
 
 
 def _chunk_by_tokens(text: str, max_tokens: int = _EMBED_MAX_TOKENS):
+    """
+    DEPRECATED: kept for backward-compat. Prefer `_chunk_for_embedding`, which yields (text, token_count).
+    This wrapper now delegates to `_chunk_for_embedding` and yields only the chunk text.
+    """
+    for chunk_text, _tc in _chunk_for_embedding(text, max_tokens):
+        yield chunk_text
+
+
+def _weighted_mean_pool(chunks: List[Tuple[List[float], int]]) -> List[float]:
+    """
+    Token-weighted mean pooling.
+    chunks: list of (vector, token_count)
+    """
+    if not chunks:
+        return []
+    vecs = []
+    weights = []
+    for vec, tok in chunks:
+        if vec is None:
+            continue
+        vecs.append(np.array(vec, dtype=float))
+        weights.append(max(1, int(tok)))
+    if not vecs:
+        return []
+    weights_arr = np.array(weights, dtype=float)
+    stacked = np.vstack(vecs)
+    weighted = (stacked.T @ weights_arr) / weights_arr.sum()
+    return weighted.tolist()
+
+
+def _normalize_text(text: str) -> str:
+    # Deterministic, minimal normalization. Adjust as needed but keep stable.
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return "\n".join(lines)
+
+
+def _embed_cache_key(provider: str, model: str, norm_ver: str, text: str) -> str:
+    payload = f"{provider}|{model}|{norm_ver}|{_normalize_text(text)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# Provider-aware chunking yielding (chunk_text, token_count)
+def _chunk_for_embedding(text: str, max_tokens: int = _EMBED_MAX_TOKENS):
+    """
+    Yield (chunk_text, token_count) pairs. Falls back gracefully when tokenizer is unavailable.
+    """
     tok = _get_tokenizer()
     if tok is None:
-        # crude fallback by words
+        # crude fallback by words ~ treat words as tokens
         words = text.split()
         for i in range(0, len(words), max_tokens):
-            yield " ".join(words[i : i + max_tokens])
+            chunk_words = words[i : i + max_tokens]
+            yield " ".join(chunk_words), len(chunk_words)
         return
     ids = tok.encode(text)
     for i in range(0, len(ids), max_tokens):
         chunk_ids = ids[i : i + max_tokens]
-        yield tok.decode(chunk_ids)
-
-
-def _mean_pool(vectors):
-    # vectors: list of list[float]
-    if not vectors:
-        return []
-    arr = np.array(vectors, dtype=float)
-    return arr.mean(axis=0).tolist()
+        yield tok.decode(chunk_ids), len(chunk_ids)
 
 
 class FinancialSituationMemory:
     def __init__(self, name, config):
         self.config = config
         self.backend_url = config["backend_url"]
-        
+
         # Determine which API to use based on backend_url
-        if "openai" in self.backend_url.lower() or "localhost:11434" in self.backend_url:
+        if (
+            "openai" in self.backend_url.lower()
+            or "localhost:11434" in self.backend_url
+        ):
             self.api_type = "openai"
             if config["backend_url"] == "http://localhost:11434/v1":
                 self.embedding = "nomic-embed-text"
             else:
                 self.embedding = "text-embedding-3-small"
-            self.client = OpenAI(
-                base_url=config["backend_url"]
-            )
-        elif "google" in self.backend_url.lower() or "generativeai" in self.backend_url.lower():
+            self.client = OpenAI(base_url=config["backend_url"])
+        elif (
+            "google" in self.backend_url.lower()
+            or "generativeai" in self.backend_url.lower()
+        ):
             self.api_type = "google"
-            self.embedding = "models/text-embedding-004"  # Google's latest embedding model
+            self.embedding = (
+                "models/text-embedding-004"  # Google's latest embedding model
+            )
             # Uses GOOGLE_API_KEY environment variable automatically
             self.google_embeddings = GoogleGenerativeAIEmbeddings(
-                model=self.embedding,
-                transport="rest",
-                request_options={
-                    "timeout": 120 
-                }
+                model=self.embedding, transport="rest", request_options={"timeout": 120}
             )
             self.client = None  # Google doesn't use the same client pattern
         else:
             raise ValueError(f"Unsupported backend URL: {self.backend_url}")
 
-            
+        # --- Embedding cache & metrics ---
+        self._embed_cache = OrderedDict()  # key -> vector
+        self._cache_lock = threading.Lock()
+        self.metrics = {"embed_calls": 0, "cache_hits": 0}
+
+        # --- Vector store ---
         self.chroma_client = chromadb.Client(Settings(allow_reset=True))
-        self.situation_collection = self.chroma_client.create_collection(name=name)
+        # use get_or_create to avoid accidental resets across runs
+        try:
+            self.situation_collection = self.chroma_client.get_or_create_collection(
+                name=name
+            )
+        except Exception:
+            # fallback for older chromadb versions
+            self.situation_collection = self.chroma_client.create_collection(name=name)
 
     def get_embedding(self, text):
-        """Get embedding for text using the configured API"""
-        if self.api_type == "openai":
-            # Token-safe embedding with chunking + mean pooling
-            total_tokens = _count_tokens(text)
-            if total_tokens <= _EMBED_MAX_TOKENS:
-                response = self.client.embeddings.create(
-                    model=self.embedding,
-                    input=text,
-                )
-                return response.data[0].embedding
-            # Split oversized input into chunks and average the vectors
-            chunk_vectors = []
-            for chunk in _chunk_by_tokens(text, _EMBED_MAX_TOKENS):
-                resp = self.client.embeddings.create(
-                    model=self.embedding,
-                    input=chunk,
-                )
-                chunk_vectors.append(resp.data[0].embedding)
-            return _mean_pool(chunk_vectors)
-        elif self.api_type == "google":
-            try:
-                total_tokens = _count_tokens(text)
-                if total_tokens <= _EMBED_MAX_TOKENS:
-                    embeddings = self.google_embeddings.embed_documents([text])
-                    return embeddings[0]
-                # Chunk and mean-pool for long inputs
-                chunk_vectors = []
-                for chunk in _chunk_by_tokens(text, _EMBED_MAX_TOKENS):
-                    vecs = self.google_embeddings.embed_documents([chunk])
-                    chunk_vectors.append(vecs[0])
-                return _mean_pool(chunk_vectors)
-            except Exception as e:
-                print(f"Google embedding error: {e}")
-                raise
+        """Get embedding for text using the configured API with caching and safe chunking."""
+        norm_text = _normalize_text(text or "")
+        # Determine a conservative per-provider chunk size (tokens)
+        # Keep 8k default for OpenAI; keep 8k-ish approximation for Google as we count with tiktoken fallback.
+        max_tokens = _EMBED_MAX_TOKENS
+
+        # Cache lookup
+        cache_key = _embed_cache_key(
+            self.api_type, self.embedding, _NORM_VER, norm_text
+        )
+        with self._cache_lock:
+            if cache_key in self._embed_cache:
+                # move to end (LRU)
+                self._embed_cache.move_to_end(cache_key)
+                self.metrics["cache_hits"] += 1
+                return self._embed_cache[cache_key]
+
+        # Helper to insert into cache with LRU eviction
+        def _cache_put(key, value):
+            with self._cache_lock:
+                self._embed_cache[key] = value
+                self._embed_cache.move_to_end(key)
+                if len(self._embed_cache) > _CACHE_MAX:
+                    self._embed_cache.popitem(last=False)  # evict LRU
+
+        # Compute embedding
+        try:
+            total_tokens = _count_tokens(norm_text)
+            if total_tokens <= max_tokens:
+                if self.api_type == "openai":
+                    resp = self.client.embeddings.create(
+                        model=self.embedding, input=norm_text
+                    )
+                    vec = resp.data[0].embedding
+                elif self.api_type == "google":
+                    vecs = self.google_embeddings.embed_documents([norm_text])
+                    vec = vecs[0]
+                else:
+                    raise ValueError(f"Unsupported api_type: {self.api_type}")
+                self.metrics["embed_calls"] += 1
+                _cache_put(cache_key, vec)
+                return vec
+
+            # Oversized: chunk + token-weighted pool
+            chunk_vecs: List[Tuple[List[float], int]] = []
+            for chunk_text, tok_count in _chunk_for_embedding(norm_text, max_tokens):
+                if self.api_type == "openai":
+                    resp = self.client.embeddings.create(
+                        model=self.embedding, input=chunk_text
+                    )
+                    vec = resp.data[0].embedding
+                elif self.api_type == "google":
+                    vecs = self.google_embeddings.embed_documents([chunk_text])
+                    vec = vecs[0]
+                else:
+                    raise ValueError(f"Unsupported api_type: {self.api_type}")
+                self.metrics["embed_calls"] += 1
+                chunk_vecs.append((vec, tok_count))
+
+            pooled = _weighted_mean_pool(chunk_vecs)
+            _cache_put(cache_key, pooled)
+            return pooled
+        except Exception as e:
+            # Do not cache failures; surface the error
+            print(f"Embedding error ({self.api_type}/{self.embedding}): {e}")
+            raise
+
+    def clear_embedding_cache(self):
+        """Clear in-process embedding cache and metrics (call on ticker change if desired)."""
+        with self._cache_lock:
+            self._embed_cache.clear()
+        self.metrics = {"embed_calls": 0, "cache_hits": 0}
 
     def add_situations(self, situations_and_advice):
         """Add financial situations and their corresponding advice. Parameter is a list of tuples (situation, rec)"""
-
         situations = []
         advice = []
         ids = []
         embeddings = []
 
-        offset = self.situation_collection.count()
+        offset = 0
+        try:
+            offset = self.situation_collection.count()
+        except Exception:
+            # best-effort; continue without offset if count fails
+            offset = 0
 
         for i, (situation, recommendation) in enumerate(situations_and_advice):
             situations.append(situation)
@@ -3627,30 +5133,42 @@ class FinancialSituationMemory:
             ids.append(str(offset + i))
             embeddings.append(self.get_embedding(situation))
 
-        self.situation_collection.add(
-            documents=situations,
-            metadatas=[{"recommendation": rec} for rec in advice],
-            embeddings=embeddings,
-            ids=ids,
-        )
+        try:
+            self.situation_collection.add(
+                documents=situations,
+                metadatas=[{"recommendation": rec} for rec in advice],
+                embeddings=embeddings,
+                ids=ids,
+            )
+        except Exception as e:
+            print(f"Chroma add error: {e}")
+            raise
 
     def get_memories(self, current_situation, n_matches=1):
         """Find matching recommendations using configured embeddings API"""
         query_embedding = self.get_embedding(current_situation)
-
-        results = self.situation_collection.query(
-            query_embeddings=[query_embedding],
-            n_results=n_matches,
-            include=["metadatas", "documents", "distances"],
-        )
+        try:
+            results = self.situation_collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_matches,
+                include=["metadatas", "documents", "distances"],
+            )
+        except Exception as e:
+            print(f"Chroma query error: {e}")
+            raise
 
         matched_results = []
-        for i in range(len(results["documents"][0])):
+        docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
+        dists = results.get("distances", [[]])[0]
+        for i in range(len(docs)):
+            meta = metas[i] if i < len(metas) else {}
+            dist = dists[i] if i < len(dists) else 1.0
             matched_results.append(
                 {
-                    "matched_situation": results["documents"][0][i],
-                    "recommendation": results["metadatas"][0][i]["recommendation"],
-                    "similarity_score": 1 - results["distances"][0][i],
+                    "matched_situation": docs[i],
+                    "recommendation": meta.get("recommendation"),
+                    "similarity_score": 1 - dist,
                 }
             )
 
@@ -3658,15 +5176,92 @@ class FinancialSituationMemory:
 
 
 if __name__ == "__main__":
-    # Example usage with Google API
-    config = {
-        "backend_url": "https://generativeai.googleapis.com/",  # or your Google config
-        
-    }
-    
-    matcher = FinancialSituationMemory("test", config)
+    """
+    Lightweight self-tests for the FinancialSituationMemory when this file is executed directly.
+    - Runs against OpenAI if OPENAI_API_KEY is set; otherwise tries Google if GOOGLE_API_KEY is set.
+    - Verifies cache hits vs. API calls.
+    - Forces chunking with a tiny token limit, and checks multiple API calls occur.
+    - Adds/queries a few situations to make sure vector store path is alive.
+    """
+    import os
+    import time
 
-    # Example data
+    use_openai = bool(os.getenv("OPENAI_API_KEY"))
+    use_google = bool(os.getenv("GOOGLE_API_KEY"))
+
+    if not (use_openai or use_google):
+        print(
+            "No API key detected. Set OPENAI_API_KEY or GOOGLE_API_KEY to run live self-tests."
+        )
+        # Still proceed to run the vector store path with a fake backend URL (will not embed)
+        # Exit early to avoid network calls.
+        exit(0)
+
+    backend_url = (
+        "https://api.openai.com/v1"
+        if use_openai
+        else "https://generativeai.googleapis.com/"
+    )
+    provider = "OpenAI" if use_openai else "Google"
+    print(f"== Running self-tests using {provider} backend ==")
+
+    cfg = {"backend_url": backend_url}
+    mem = FinancialSituationMemory("selftest_memory", cfg)
+    mem.clear_embedding_cache()
+
+    # --- Test 1: Cache hit for short text ---
+    text_short = "Hello world, this is a short text for caching test."
+    print("\n[TEST 1] cache hits vs. API calls")
+    v1 = mem.get_embedding(text_short)
+    v2 = mem.get_embedding(text_short)  # should be a cache hit
+    print("  Metrics:", mem.metrics)
+    assert isinstance(v1, list) and len(v1) > 0, "Embedding vector should be non-empty"
+    assert v1 == v2, "Second call should return cached vector"
+    assert mem.metrics["cache_hits"] == 1, "Expected one cache hit"
+    assert mem.metrics["embed_calls"] == 1, "Expected only one API call for same text"
+
+    # --- Test 2: Force chunking + weighted pooling ---
+    print("\n[TEST 2] forced chunking & weighted pooling")
+    long_text = " ".join(
+        [f"word{i}" for i in range(1, 61)]
+    )  # 60 space-delimited tokens
+    # Save originals
+    _orig_token_limit = _EMBED_MAX_TOKENS
+    _orig_get_tok = _get_tokenizer
+    try:
+        # Force small chunking window
+        globals()["_EMBED_MAX_TOKENS"] = 5
+
+        # Replace tokenizer with a deterministic whitespace tokenizer
+        def _fake_tok():
+            class _Tok:
+                def encode(self, s):
+                    return s.split()
+
+                def decode(self, ids):
+                    return " ".join(ids)
+
+            return _Tok()
+
+        globals()["_get_tokenizer"] = _fake_tok
+
+        before_calls = mem.metrics["embed_calls"]
+        vec = mem.get_embedding(long_text)
+        after_calls = mem.metrics["embed_calls"]
+        print("  embed calls during chunking:", after_calls - before_calls)
+        assert (
+            after_calls - before_calls >= 2
+        ), "Expected multiple API calls due to chunking"
+        assert (
+            isinstance(vec, list) and len(vec) > 0
+        ), "Pooled vector should be non-empty"
+    finally:
+        # Restore globals
+        globals()["_EMBED_MAX_TOKENS"] = _orig_token_limit
+        globals()["_get_tokenizer"] = _orig_get_tok
+
+    # --- Test 3: Add situations and query memories ---
+    print("\n[TEST 3] vector store add/query")
     example_data = [
         (
             "High inflation rate with rising interest rates and declining consumer spending",
@@ -3685,30 +5280,27 @@ if __name__ == "__main__":
             "Rebalance portfolio to maintain target allocations. Consider increasing exposure to sectors benefiting from higher rates.",
         ),
     ]
+    mem.add_situations(example_data)
 
-    # Add the example situations and recommendations
-    matcher.add_situations(example_data)
+    current_situation = (
+        "Market showing increased volatility in tech sector, with institutional investors "
+        "reducing positions and rising interest rates affecting growth stock valuations"
+    )
 
-    # Example query
-    current_situation = """
-    Market showing increased volatility in tech sector, with institutional investors 
-    reducing positions and rising interest rates affecting growth stock valuations
-    """
+    recs = mem.get_memories(current_situation, n_matches=2)
+    for i, rec in enumerate(recs, 1):
+        print(f"\n  Match {i}:")
+        print(f"    Similarity Score: {rec['similarity_score']:.3f}")
+        print(f"    Recommendation:  {rec['recommendation']}")
 
-    try:
-        recommendations = matcher.get_memories(current_situation, n_matches=2)
+    print("\n== Self-tests complete ==")
+    print("Final metrics:", mem.metrics)
 
-        for i, rec in enumerate(recommendations, 1):
-            print(f"\nMatch {i}:")
-            print(f"Similarity Score: {rec['similarity_score']:.2f}")
-            print(f"Matched Situation: {rec['matched_situation']}")
-            print(f"Recommendation: {rec['recommendation']}")
-
-    except Exception as e:
-        print(f"Error during recommendation: {str(e)}")
 ===== END OF FILE: ./tradingagents/agents/utils/memory.py =====
 
 ===== FILE: ./tradingagents/agents/utils/agent_utils.py =====
+ # lightweight per-process cache for batch indicator calls (avoids duplicate work in a run)
+_batch_indicators_cache: dict[tuple[str, str, int, tuple[str, ...]], str] = {}
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage, AIMessage
 from typing import List
 from typing import Annotated
@@ -3988,6 +5580,51 @@ class Toolkit:
 
     @staticmethod
     @tool
+    def get_stockstats_multi_indicators_report_online(
+        symbol: Annotated[str, "ticker symbol of the company"],
+        indicators: Annotated[list[str], "technical indicators to compute (e.g., ['rsi','macd','close_50_sma'])"],
+        curr_date: Annotated[str, "The current trading date you are trading on, YYYY-mm-dd"],
+        look_back_days: Annotated[int, "how many days to look back"] = 30,
+    ) -> str:
+        """
+        Retrieve **multiple** stock stats indicators for a given ticker in **one** tool call.
+        Internally loops over the existing single-indicator interface to avoid new dependencies.
+        Returns a combined, human-readable report.
+        """
+        try:
+            # normalize & cache key
+            norm_inds = tuple(sorted([i.strip() for i in indicators if i and isinstance(i, str)]))
+            cache_key = (symbol.upper().strip(), curr_date, int(look_back_days), norm_inds)
+            if cache_key in _batch_indicators_cache:
+                print(f"[TOOLKIT][CACHE HIT] Stock stats (BATCH) ONLINE for {symbol}, {len(norm_inds)} indicators, date: {curr_date}")
+                return _batch_indicators_cache[cache_key]
+
+            print(f"[TOOLKIT] Fetching stock stats (BATCH) ONLINE for {symbol}, {len(norm_inds)} indicators, date: {curr_date}")
+            reports: list[str] = []
+            for ind in norm_inds:
+                try:
+                    r = interface.get_stock_stats_indicators_window(
+                        symbol, ind, curr_date, look_back_days, True
+                    )
+                except Exception as ie:
+                    r = handle_tool_error(
+                        "get_stockstats_multi_indicators_report_online/subcall",
+                        ie, symbol=symbol, indicator=ind, curr_date=curr_date, look_back_days=look_back_days,
+                    )
+                reports.append(str(r))
+
+            combined = "\n\n".join(reports)
+            print(f"[TOOLKIT] Successfully retrieved stock stats (BATCH) ONLINE for {symbol}")
+            _batch_indicators_cache[cache_key] = combined
+            return combined
+        except Exception as e:
+            return handle_tool_error(
+                "get_stockstats_multi_indicators_report_online", e,
+                symbol=symbol, indicators=indicators, curr_date=curr_date, look_back_days=look_back_days,
+            )
+
+    @staticmethod
+    @tool
     def get_finnhub_company_insider_sentiment(
         ticker: Annotated[str, "ticker symbol for the company"],
         curr_date: Annotated[
@@ -4214,7 +5851,8 @@ class Toolkit:
 ===== END OF FILE: ./tradingagents/agents/utils/agent_utils.py =====
 
 ===== FILE: ./tradingagents/agents/utils/agent_states.py =====
-from typing import Annotated, Sequence
+from typing import Annotated, Sequence, List, Dict, Any
+import os
 from datetime import date, timedelta, datetime
 from typing_extensions import TypedDict, Optional
 from langchain_openai import ChatOpenAI
@@ -4277,6 +5915,15 @@ class AgentState(MessagesState):
     ]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
 
+    # OPTIMIZATION: Cached memories to avoid duplicate retrievals
+    past_memories: Annotated[
+        List[Dict[str, Any]], "Cached past memories for all agents to use"
+    ]
+    past_memories_preview: Annotated[
+        str, "LLM-compressed, token-bounded preview of past memories"
+    ]
+    past_memories_str: Annotated[str, "Formatted string of past memories"]
+
     # researcher team discussion step
     investment_debate_state: Annotated[
         InvestDebateState, "Current state of the debate on if to invest or not"
@@ -4290,6 +5937,345 @@ class AgentState(MessagesState):
         RiskDebateState, "Current state of the debate on evaluating risk"
     ]
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
+
+
+# Fallback preview builder (non-LLM)
+def _build_preview_fallback(
+    past_memories: List[Dict[str, Any]], max_items: int = 5, max_chars: int = 1200
+) -> str:
+    """
+    Fallback (non-LLM) preview: builds a compact, readable list with IDs.
+    Keeps full text in state['past_memories'] and only shows short snippets here.
+    """
+    if not past_memories:
+        return "No past memories found."
+    out = ["Past similar cases (preview):"]
+    total = 0
+    for i, rec in enumerate(past_memories[:max_items], 1):
+        txt = (rec.get("recommendation") or "").strip()
+        score = rec.get("similarity_score", None)
+        snip = txt[:240] + ("…" if len(txt) > 240 else "")
+        line = (
+            f"- ID={i} | score={score:.3f} | {snip}"
+            if isinstance(score, (int, float))
+            else f"- ID={i} | {snip}"
+        )
+        # stop if would exceed cap
+        if max_chars and total + len(line) + 1 > max_chars:
+            break
+        out.append(line)
+        total += len(line) + 1
+    return "\n".join(out) if len(out) > 1 else "No past memories found."
+
+
+# LLM-based summarizer for past memories
+def _summarize_past_memories_with_llm(
+    past_memories: List[Dict[str, Any]],
+    *,
+    max_tokens: int = 1024,
+    model: str = "gpt-5-mini",
+) -> Optional[str]:
+    """
+    Single LLM call that compresses K retrieved memories into a token-bounded bullet list.
+    Uses OpenAI via langchain_openai.ChatOpenAI if OPENAI_API_KEY is present.
+    Returns None if unavailable or on error.
+    """
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        llm = ChatOpenAI(
+            model=model, max_tokens=max_tokens, api_key=api_key
+        )
+        # Build a compact system+user prompt
+        items = []
+        for i, rec in enumerate(past_memories, 1):
+            scenario = (rec.get("matched_situation") or "").strip().replace("\n", " ")
+            recommendation = (
+                (rec.get("recommendation") or "").strip().replace("\n", " ")
+            )
+            # Build a safe score string
+            score_val = rec.get("similarity_score", None)
+            if isinstance(score_val, (int, float)):
+                score_str = f"{score_val:.3f}"
+            else:
+                try:
+                    # Handle cases where score is a string number
+                    score_str = f"{float(score_val):.3f}"
+                except (TypeError, ValueError):
+                    score_str = "NA"
+            items.append(
+                f"ID={i} | score={score_str} | scenario: {scenario} | action: {recommendation}"
+            )
+        joined = "\n".join(items[:10])  # hard cap to avoid giant prompts
+        system = (
+            f"You compress prior cases into an briefing for a trading debate.\n"
+            f"Output <= {max_tokens} tokens, bullet list. Keep IDs so agents can cross-reference.\n"
+            f"Each bullet MUST include: ID, score, 1-5 line scenario, 1-line action. Include constraints/numbers if present, and unsure options."
+        )
+        user = f"Cases:\n{joined}\n\nWrite the compressed bullets now."
+        resp = llm.invoke(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        )
+        text = resp.content if hasattr(resp, "content") else str(resp)
+        # basic sanity
+        text = (text or "").strip()
+        if not text:
+            return None
+        return text
+    except Exception as e:
+        print(f"[MEMORY BROKER] LLM summarization failed: {e}")
+        return None
+
+
+def create_memory_broker(
+    shared_memory,
+    *,
+    n_matches: int = 2,
+    min_chars: int = 400,
+    summary_max_tokens: int = 1024,
+    summary_model: str = "gpt-4o-mini",
+    temperature: float = 0.2,
+    preview_max_items: int = 5,
+    preview_max_chars: int = 2048,
+    llm_only_if_needed: bool = True,
+    preview_trigger_chars: int = 1200,
+):
+    """
+    Creates a memory broker node that fetches memories once after analyst reports are complete.
+    This avoids duplicate embedding and retrieval calls across all agents.
+    - Single shared memory instance across all agents.
+    - Idempotent: if memories already exist in state, returns without doing work.
+    - Resilient: catches memory lookup failures and falls back to empty.
+    - Compact: builds an LLM-compressed preview (single call per date); falls back to a deterministic preview if no API key.
+
+    Tunables:
+    - n_matches: number of nearest memories to fetch
+    - min_chars: minimum characters required in the current situation before querying memory
+    - summary_max_tokens, summary_model, temperature: controls for the LLM compression call
+    - preview_max_items, preview_max_chars: fallback preview sizing when LLM unavailable
+    - llm_only_if_needed: if True, skip LLM and use RAW concatenation when small enough
+    - preview_trigger_chars: max raw length (chars) before LLM summarization is triggered
+    """
+
+    def memory_broker_node(state) -> dict:
+        # If we already cached memories (or even just the string), do nothing (idempotent)
+        if state.get("past_memories") or state.get("past_memories_str"):
+            return {}
+
+        # Build the current situation from the four reports (only non-empty parts)
+        parts = []
+        market_report = (state.get("market_report") or "").strip()
+        sentiment_report = (state.get("sentiment_report") or "").strip()
+        news_report = (state.get("news_report") or "").strip()
+        fundamentals_report = (state.get("fundamentals_report") or "").strip()
+
+        if market_report:
+            parts.append(market_report)
+        if sentiment_report:
+            parts.append(sentiment_report)
+        if news_report:
+            parts.append(news_report)
+        if fundamentals_report:
+            parts.append(fundamentals_report)
+
+        if not parts:
+            # Analysts haven't produced anything yet
+            return {
+                "past_memories": [],
+                "past_memories_preview": "No past memories found.",
+                "past_memories_str": "No past memories found.",
+            }
+
+        curr_situation = "\n\n".join(parts)
+
+        # Guard against issuing queries for very small contexts
+        if min_chars and len(curr_situation) < min_chars:
+            print(
+                f"[MEMORY BROKER] Skipping memory query (situation too small: {len(curr_situation)} chars < {min_chars})"
+            )
+            return {
+                "past_memories": [],
+                "past_memories_preview": "No past memories found.",
+                "past_memories_str": "No past memories found.",
+            }
+
+        print("[MEMORY BROKER] Fetching memories once for all agents...")
+        try:
+            past_memories = shared_memory.get_memories(
+                curr_situation, n_matches=n_matches
+            )
+        except Exception as e:
+            print(f"[MEMORY BROKER] Memory lookup failed: {e}")
+            past_memories = []
+
+        # Compute diagnostics on original memory content
+        orig_total_chars = sum(len((rec.get("recommendation") or "")) for rec in past_memories)
+        raw_lines = []
+        for i, rec in enumerate(past_memories, 1):
+            rec_txt = (rec.get("recommendation") or "").strip().replace("\n", " ")
+            score_val = rec.get("similarity_score", None)
+            if isinstance(score_val, (int, float)):
+                score_str = f"{score_val:.3f}"
+            else:
+                try:
+                    score_str = f"{float(score_val):.3f}"
+                except (TypeError, ValueError):
+                    score_str = "NA"
+            raw_lines.append(f"- ID={i} | score={score_str} | {rec_txt}")
+        raw_concat = "\n".join(raw_lines)
+        raw_len = len(raw_concat)
+
+        # Decide preview strategy:
+        #  - If llm_only_if_needed=True and raw is short enough, use RAW (no LLM).
+        #  - Else attempt LLM summary, falling back to deterministic preview.
+        use_raw = llm_only_if_needed and raw_len <= max(preview_trigger_chars, 0)
+
+        if use_raw:
+            preview = raw_concat
+            source = "RAW"
+        else:
+            preview = _summarize_past_memories_with_llm(
+                past_memories,
+                max_tokens=summary_max_tokens,
+                model=summary_model,
+            )
+            source = "LLM" if preview is not None else "FALLBACK"
+            if preview is None:
+                preview = _build_preview_fallback(
+                    past_memories, max_items=preview_max_items, max_chars=preview_max_chars
+                )
+
+        print(
+            f"[MEMORY BROKER] Cached {len(past_memories)} memories; "
+            f"orig_total_chars={orig_total_chars}; raw_concat_len={raw_len}; "
+            f"preview_source={source}; preview_size={len(preview)} chars"
+        )
+
+        # Store in state for all agents to use; keep legacy field for compatibility
+        return {
+            "past_memories": past_memories,
+            "past_memories_preview": preview,
+            "past_memories_str": preview,
+        }
+
+    return memory_broker_node
+
+
+if __name__ == "__main__":
+    """
+    Lightweight self-tests for create_memory_broker when executed directly:
+    - Test 1: normal path builds situation, fetches n_matches, formats/caps string.
+    - Test 2: idempotency (second call should do nothing and not re-hit memory).
+    - Test 3: min_chars guard (skips lookup if situation too short).
+    """
+
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class DummySharedMemory:
+        calls: int = 0
+        last_query: str = ""
+        dataset: list = field(
+            default_factory=lambda: [
+                {"matched_situation": "Case A", "recommendation": "Rec A " + "x" * 200},
+                {"matched_situation": "Case B", "recommendation": "Rec B " + "y" * 200},
+                {"matched_situation": "Case C", "recommendation": "Rec C " + "z" * 200},
+            ]
+        )
+
+        def get_memories(self, current_situation, n_matches=2):
+            self.calls += 1
+            self.last_query = current_situation
+            return self.dataset[:n_matches]
+
+    def _print_state(label, s):
+        print(f"== {label} ==\n")
+        print("past_memories count:", len(s.get("past_memories", [])))
+        print("past_memories_str len:", len((s.get("past_memories_str") or "")))
+        print("past_memories_preview len:", len((s.get("past_memories_preview") or "")))
+        print("broker returned keys:", list(s.keys()))
+
+    # ---- Test 1: Normal path ----
+    shared = DummySharedMemory()
+    broker = create_memory_broker(
+        shared,
+        n_matches=2,
+        min_chars=50,
+        summary_max_tokens=200,
+        llm_only_if_needed=True,
+        preview_trigger_chars=800,  # small enough that two short recs should stay RAW in most cases
+    )
+
+    state = {
+        "market_report": "Market says uptrend continues. " * 3,
+        "sentiment_report": "Sentiment mixed but improving. " * 3,
+        "news_report": "Earnings season shows surprises. " * 3,
+        "fundamentals_report": "Margins stable with modest growth. " * 3,
+    }
+
+    out1 = broker(state)
+    _print_state("Test 1 (normal)", out1)
+    assert len(out1["past_memories"]) == 2, "Should fetch n_matches memories"
+    assert shared.calls == 1, "Memory should be queried exactly once"
+    assert (
+        isinstance(out1.get("past_memories_preview"), str)
+        and len(out1["past_memories_preview"]) > 0
+    ), "Preview should exist"
+    assert (
+        out1["past_memories_str"] == out1["past_memories_preview"]
+    ), "Legacy field should mirror preview"
+
+    # Merge back into state as graph would do
+    state.update(out1)
+
+    # ---- Test 1b: Force LLM path by lowering trigger threshold ----
+    state_llm = {
+        "market_report": state["market_report"],
+        "sentiment_report": state["sentiment_report"],
+        "news_report": state["news_report"],
+        "fundamentals_report": state["fundamentals_report"],
+    }
+    shared_llm = DummySharedMemory()
+    broker_llm = create_memory_broker(
+        shared_llm,
+        n_matches=2,
+        min_chars=50,
+        summary_max_tokens=200,
+        llm_only_if_needed=True,
+        preview_trigger_chars=10,  # force summarization even for tiny raw payloads
+    )
+    out1b = broker_llm(state_llm)
+    _print_state("Test 1b (forced LLM path)", out1b)
+    assert len(out1b["past_memories"]) == 2
+    assert shared_llm.calls == 1
+
+    # ---- Test 2: Idempotency (should not re-hit memory) ----
+    out2 = broker(state)
+    _print_state("Test 2 (idempotent)", out2)
+    assert out2 == {}, "Broker should be a no-op when memories already present"
+    assert shared.calls == 1, "Memory should not be hit again"
+
+    # ---- Test 3: min_chars guard (too short → skip) ----
+    state_small = {
+        "market_report": "short",
+        "sentiment_report": "",
+        "news_report": "",
+        "fundamentals_report": "",
+    }
+    shared2 = DummySharedMemory()
+    broker2 = create_memory_broker(
+        shared2, n_matches=2, min_chars=20, summary_max_tokens=200
+    )
+    out3 = broker2(state_small)
+    _print_state("Test 3 (min_chars guard)", out3)
+    assert out3["past_memories"] == [], "Should skip lookup and return empty memories"
+    assert (
+        "No past memories" in out3["past_memories_str"]
+    ), "Should set friendly message"
+    assert shared2.calls == 0, "Memory should not be hit for too-small situations"
+
+    print("\nAll create_memory_broker self-tests passed.")
 
 ===== END OF FILE: ./tradingagents/agents/utils/agent_states.py =====
 
@@ -4309,11 +6295,15 @@ def create_market_analyst(llm, toolkit):
         if toolkit.config["online_tools"]:
             tools = [
                 toolkit.get_YFin_data_online,
+                # Prefer batch to collapse multiple indicator calls into a single tool call
+                toolkit.get_stockstats_multi_indicators_report_online,
+                # Keep single-indicator as a fallback (e.g., if exactly one indicator is needed)
                 toolkit.get_stockstats_indicators_report_online,
             ]
         else:
             tools = [
                 toolkit.get_YFin_data,
+                # (No offline batch tool) keep single-indicator only
                 toolkit.get_stockstats_indicators_report,
             ]
 
@@ -4344,6 +6334,7 @@ Volume-Based Indicators:
 
 - Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both rsi and stochrsi). Also briefly explain why they are suitable for the given market context. When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Please make sure to call get_YFin_data first to retrieve the CSV that is needed to generate indicators. Write a very detailed and nuanced report of the trends you observe. Do not simply state the trends are mixed, provide detailed and finegrained analysis and insights that may help traders make decisions."""
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
+            + """When you need multiple indicators, prefer calling get_stockstats_multi_indicators_report_online once with a list of indicators (after fetching price data), rather than calling the single-indicator tool many times."""
         )
 
         prompt = ChatPromptTemplate.from_messages(
@@ -4376,7 +6367,7 @@ Volume-Based Indicators:
 
         if len(result.tool_calls) == 0:
             report = result.content
-       
+
         return {
             "messages": [result],
             "market_report": report,
@@ -4783,6 +6774,8 @@ def get_data_in_range(ticker, start_date, end_date, data_type, data_dir, period=
 
 ===== FILE: ./tradingagents/dataflows/interface.py =====
 from typing import Annotated, Dict
+import time
+from pathlib import Path
 from datetime import datetime, timedelta
 from .reddit_utils import fetch_top_from_category
 from .yfin_utils import *
@@ -4839,6 +6832,49 @@ def _extract_text(resp):
                 if txt:
                     return txt
     return ""
+
+# --- simple disk cache helpers for Responses outputs ---
+_DEF_CACHE_ROOT = Path(DATA_DIR) / "openai_news_cache"
+
+_DEF_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+
+def _cache_read(rel_path: Path) -> str | None:
+    try:
+        p = _DEF_CACHE_ROOT / rel_path
+        if p.exists() and p.is_file():
+            return p.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    return None
+
+def _cache_write(rel_path: Path, text: str) -> None:
+    try:
+        p = _DEF_CACHE_ROOT / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+# --- naive retry with exponential backoff for Responses API ---
+_DEF_MAX_ATTEMPTS = 4
+_DEF_BASE_SLEEP = 1.5
+
+def _responses_with_retries(create_fn, *args, **kwargs):
+    attempts = 0
+    while True:
+        try:
+            return create_fn(*args, **kwargs)
+        except Exception as e:
+            attempts += 1
+            if attempts >= _DEF_MAX_ATTEMPTS:
+                raise
+            # Try to parse Retry-After if present on the exception text
+            msg = str(e)
+            wait = _DEF_BASE_SLEEP * (2 ** (attempts - 1))
+            # Best-effort surfacing
+            print(f"[INTERFACE][RETRY] {msg.strip()[:160]} … sleeping {wait:.2f}s (attempt {attempts}/{_DEF_MAX_ATTEMPTS})")
+            time.sleep(wait)
+            continue
 
 
 def get_finnhub_news(
@@ -5244,6 +7280,8 @@ def get_reddit_company_news(
     return f"##{ticker} News Reddit, from {before} to {curr_date}:\n\n{news_str}"
 
 
+#
+# See also: get_stock_stats_multi_indicators_window() for batch usage.
 def get_stock_stats_indicators_window(
     symbol: Annotated[str, "ticker symbol of the company"],
     indicator: Annotated[str, "technical indicator to get the analysis and report of"],
@@ -5378,6 +7416,35 @@ def get_stock_stats_indicators_window(
     )
 
     return result_str
+
+
+# Batch version: run window stats for a list of indicators
+def get_stock_stats_multi_indicators_window(
+    symbol: Annotated[str, "ticker symbol of the company"],
+    indicators: Annotated[list[str], "list of technical indicators (e.g. ['rsi','macd','close_50_sma'])"],
+    curr_date: Annotated[str, "The current trading date you are trading on, YYYY-mm-dd"],
+    look_back_days: Annotated[int, "how many days to look back"],
+    online: Annotated[bool, "to fetch data online or offline"],
+) -> str:
+    """
+    Batch version that composes a single report by looping over the existing
+    single-indicator implementation. This keeps semantics identical while
+    enabling higher-level tools to make **one** call for many indicators.
+    """
+    norm_inds = [i.strip() for i in indicators if isinstance(i, str) and i.strip()]
+    if not norm_inds:
+        return ""
+    print(f"[INTERFACE] Fetching stock stats (BATCH) for {symbol}: {len(norm_inds)} indicators, date {curr_date}")
+    parts: list[str] = []
+    for ind in sorted(set(norm_inds)):
+        try:
+            parts.append(
+                get_stock_stats_indicators_window(symbol, ind, curr_date, look_back_days, online)
+            )
+        except Exception as e:
+            parts.append(f"## {ind} error: {e}")
+    print(f"[INTERFACE] Completed stock stats (BATCH) for {symbol}")
+    return "\n\n".join(parts)
 
 
 def get_stockstats_indicator(
@@ -5529,11 +7596,17 @@ def get_YFin_data(
 
 def get_stock_news_openai(ticker, curr_date):
     config = get_config()
-    client = create_openai_client_with_custom_retry()  # keep proxy/base_url behavior
+    client = create_openai_client_with_custom_retry()
+
+    cache_rel = Path("stock") / ticker.upper() / f"{curr_date}.txt"
+    cached = _cache_read(cache_rel)
+    if cached:
+        print(f"[INTERFACE][CACHE HIT] stock news for {ticker} on {curr_date}")
+        return cached
 
     curr_dt_obj = datetime.strptime(curr_date, "%Y-%m-%d")
     start_date = (curr_dt_obj - timedelta(days=14)).strftime("%Y-%m-%d")
-    end_date = curr_date  # already a string
+    end_date = curr_date
 
     instructions = (
         "You are a news aggregator. Provide only factual information without analysis or interpretation."
@@ -5559,22 +7632,42 @@ For each item, provide:
 Just provide the raw information, no analysis or opinions.
 """.strip()
 
-    response = client.responses.create(
-        model=config["openai_model"],
-        instructions=instructions,
-        input=[{"role": "user", "content": user_prompt}],
-        tools=[{"type": "web_search_preview", "search_context_size": "medium"}],
-        max_output_tokens=4096,
-        top_p=1,
-        store=True,
-    )
-
-    return _extract_text(response)
+    try:
+        resp = _responses_with_retries(
+            client.responses.create,
+            model='gpt-4o-mini',
+            instructions=instructions,
+            input=[{"role": "user", "content": user_prompt}],
+            tools=[{"type": "web_search_preview", "search_context_size": "medium"}],
+            max_output_tokens=4096,
+            top_p=1,
+            store=True,
+        )
+        text = _extract_text(resp)
+        _cache_write(cache_rel, text)
+        return text
+    except Exception as e:
+        # Fallback: try Google News (no LLM) to keep pipeline moving
+        print(f"[INTERFACE][FALLBACK] stock news via Google News due to: {e}")
+        try:
+            text = get_google_news(ticker, curr_date, 14)
+            if text:
+                _cache_write(cache_rel, text)
+            return text
+        except Exception:
+            return ""
 
 
 def get_global_news_openai(curr_date):
     config = get_config()
-    client = create_openai_client_with_custom_retry() # keep proxy/base_url behavior
+    client = create_openai_client_with_custom_retry()
+
+    cache_rel = Path("global") / f"{curr_date}.txt"
+    cached = _cache_read(cache_rel)
+    if cached:
+        print(f"[INTERFACE][CACHE HIT] global news for {curr_date}")
+        return cached
+
     curr_dt_obj = datetime.strptime(curr_date, "%Y-%m-%d")
     start_date = (curr_dt_obj - timedelta(days=14)).strftime("%Y-%m-%d")
 
@@ -5600,17 +7693,29 @@ For each item, provide:
 Just provide the raw information, no analysis or commentary.
 """.strip()
 
-    response = client.responses.create(
-        model=config["openai_model"],
-        instructions=instructions,
-        input=[{"role": "user", "content": user_prompt}],
-        tools=[{"type": "web_search_preview", "search_context_size": "medium"}],        
-        max_output_tokens=4096,
-        top_p=1,
-        store=True,
-    )
-
-    return _extract_text(response)
+    try:
+        resp = _responses_with_retries(
+            client.responses.create,
+            model=config["openai_model"],
+            instructions=instructions,
+            input=[{"role": "user", "content": user_prompt}],
+            tools=[{"type": "web_search_preview", "search_context_size": "medium"}],
+            max_output_tokens=4096,
+            top_p=1,
+            store=True,
+        )
+        text = _extract_text(resp)
+        _cache_write(cache_rel, text)
+        return text
+    except Exception as e:
+        print(f"[INTERFACE][FALLBACK] global news via Google News due to: {e}")
+        try:
+            text = get_google_news("global markets", curr_date, 14)
+            if text:
+                _cache_write(cache_rel, text)
+            return text
+        except Exception:
+            return ""
 
 
 def get_fundamentals_openai(ticker, curr_date):
