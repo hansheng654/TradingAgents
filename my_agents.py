@@ -389,12 +389,12 @@ if __name__ == "__main__":
     else:
         # Real agent configuration - YOUR CONFIG
         custom_cfg = {
-            # "llm_provider": "google",
-            # "backend_url": "https://generativelanguage.googleapis.com/v1",
-            # "deep_think_llm": "gemini-2.5-flash-lite",
-            # "quick_think_llm": "gemini-2.0-flash",
-            "deep_think_llm": "gpt-5",
-            "quick_think_llm": "gpt-5-mini",
+            "llm_provider": "google",
+            "backend_url": "https://generativelanguage.googleapis.com/v1",
+            "deep_think_llm": "gemini-2.5-flash-lite",
+            "quick_think_llm": "gemini-2.0-flash",
+            # "deep_think_llm": "gpt-5",
+            # "quick_think_llm": "gpt-5-mini",
             "max_debate_rounds": 1,
             "online_tools": True,  # Set to False for faster testing
         }
@@ -405,7 +405,7 @@ if __name__ == "__main__":
         start_cash=1_000.0,
         fee=1.0,
         config_overrides=custom_cfg,
-        debug=True,
+        debug=False,
     )
 
     # Run trades

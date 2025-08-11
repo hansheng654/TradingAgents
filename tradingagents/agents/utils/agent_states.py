@@ -6,6 +6,7 @@ from langchain_openai import ChatOpenAI
 from tradingagents.agents import *
 from langgraph.prebuilt import ToolNode
 from langgraph.graph import END, StateGraph, START, MessagesState
+import time
 
 
 # Researcher team state
@@ -247,14 +248,17 @@ def create_memory_broker(
                 "past_memories_str": "No past memories found.",
             }
 
+        t_mem = time.time()
         print("[MEMORY BROKER] Fetching memories once for all agents...")
         try:
             past_memories = shared_memory.get_memories(
                 curr_situation, n_matches=n_matches
             )
+            print(f"[TIMING] Memory fetch: {time.time() - t_mem:.2f}s")
         except Exception as e:
             print(f"[MEMORY BROKER] Memory lookup failed: {e}")
             past_memories = []
+            print(f"[TIMING] Memory fetch failed after {time.time() - t_mem:.2f}s")
 
         # Compute diagnostics on original memory content
         orig_total_chars = sum(len((rec.get("recommendation") or "")) for rec in past_memories)
@@ -273,6 +277,8 @@ def create_memory_broker(
         raw_concat = "\n".join(raw_lines)
         raw_len = len(raw_concat)
 
+        t_sum = time.time()
+
         # Decide preview strategy:
         #  - If llm_only_if_needed=True and raw is short enough, use RAW (no LLM).
         #  - Else attempt LLM summary, falling back to deterministic preview.
@@ -281,6 +287,7 @@ def create_memory_broker(
         if use_raw:
             preview = raw_concat
             source = "RAW"
+            print(f"[TIMING] Memory RAW preview build: {time.time() - t_sum:.2f}s")
         else:
             preview = _summarize_past_memories_with_llm(
                 past_memories,
@@ -288,10 +295,14 @@ def create_memory_broker(
                 model=summary_model,
             )
             source = "LLM" if preview is not None else "FALLBACK"
+            if preview is not None:
+                print(f"[TIMING] Memory LLM summarization: {time.time() - t_sum:.2f}s")
             if preview is None:
                 preview = _build_preview_fallback(
                     past_memories, max_items=preview_max_items, max_chars=preview_max_chars
                 )
+            else:
+                print(f"[TIMING] Memory fallback summarization: {time.time() - t_sum:.2f}s")
 
         print(
             f"[MEMORY BROKER] Cached {len(past_memories)} memories; "

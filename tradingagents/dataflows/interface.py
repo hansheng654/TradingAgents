@@ -18,30 +18,77 @@ import yfinance as yf
 from openai import OpenAI
 from .config import get_config, set_config, DATA_DIR
 import httpx
+import inspect
+import threading
 
-def create_openai_client_with_custom_retry():
-    """Create OpenAI client with enhanced retry configuration"""
-    config = get_config()
-    
-    # Custom HTTP client with longer timeouts and retry behavior
-    http_client = httpx.Client(
-        timeout=httpx.Timeout(
-            connect=30.0,   # 30 seconds to connect
-            read=180.0,     # 3 minutes to read response  
-            write=60.0,     # 1 minute to write request
-            pool=120.0      # 2 minutes for connection pooling
-        ),
-        limits=httpx.Limits(
-            max_connections=10,
-            max_keepalive_connections=5
-        )
+# ---- HTTPX timing hooks ----------------------------------------------------
+_callsite_lock = threading.Lock()
+
+def _find_callsite():
+    """
+    Best-effort: walk the current stack and return the first frame that
+    belongs to our project (i.e., not in site-packages/httpx/openai).
+    Returns a short string like 'agents/analysts/market_analyst.py:market_analyst_node:123'
+    """
+    try:
+        for frame in inspect.stack():
+            fname = frame.filename.replace("\\", "/")
+            if any(x in fname for x in ("/site-packages/", "/dist-packages/", "/.venv/", "/venv/")):
+                continue
+            if "/httpx/" in fname or "/openai/" in fname or "/langchain" in fname:
+                continue
+            if "python" in fname and "lib" in fname and "/http" in fname:
+                continue
+            # Heuristic: prefer our repo paths
+            if "tradingagents/" in fname or "cli/" in fname or "my_agents.py" in fname:
+                short = fname.split("tradingagents/", 1)[-1] if "tradingagents/" in fname else fname.split("/")[-1]
+                return f"{short}:{frame.function}:{frame.lineno}"
+        # Fallback: top user frame
+        top = inspect.stack()[-1]
+        return f"{top.filename}:{top.function}:{top.lineno}"
+    except Exception:
+        return "unknown"
+
+def _httpx_with_timing(purpose: str | None = None) -> httpx.Client:
+    """
+    Create an httpx.Client that logs per-request start/stop with durations,
+    endpoint path, status code, and a guessed callsite. Also carries a
+    'purpose' tag provided by the caller (e.g., 'fundamentals', 'news', etc.).
+    """
+    def on_request(request: httpx.Request):
+        # store timing + metadata on request object
+        request.extensions["t0"] = time.time()
+        request.extensions["purpose"] = purpose or ""
+        request.extensions["callsite"] = _find_callsite()
+        path = getattr(request.url, "raw_path", None) or request.url.path
+        print(f"[TIMING][HTTPX] → {request.method} {path} purpose={request.extensions['purpose']} callsite={request.extensions['callsite']}")
+
+    def on_response(response: httpx.Response):
+        t0 = response.request.extensions.get("t0")
+        path = getattr(response.request.url, "raw_path", None) or response.request.url.path
+        purpose_tag = response.request.extensions.get("purpose", "")
+        callsite = response.request.extensions.get("callsite", "unknown")
+        if t0:
+            dt = time.time() - t0
+            print(f"[TIMING][HTTPX] ← {path} {response.status_code} in {dt:.2f}s purpose={purpose_tag} callsite={callsite}")
+        else:
+            print(f"[TIMING][HTTPX] ← {path} {response.status_code} (no start time) purpose={purpose_tag} callsite={callsite}")
+
+    return httpx.Client(
+        timeout=httpx.Timeout(connect=30.0, read=180.0, write=60.0, pool=120.0),
+        limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        event_hooks={"request": [on_request], "response": [on_response]},
     )
-    
+
+def create_openai_client_with_custom_retry(purpose: str | None = None):
+    """Create OpenAI client with enhanced retry configuration + per-request timing hooks."""
+    config = get_config()
+    http_client = _httpx_with_timing(purpose=purpose)
     return OpenAI(
         base_url=config["openai_url"],
-        max_retries=8,          # Increase retries from 3 to 8
-        timeout=180.0,          # 3 minute overall timeout
-        http_client=http_client # Use our custom HTTP settings
+        max_retries=8,
+        timeout=180.0,
+        http_client=http_client,
     )
 
 # Helper to extract text from OpenAI Responses API output
@@ -122,6 +169,7 @@ def get_finnhub_news(
 
     """
 
+    t0 = time.time()
     start_date = datetime.strptime(curr_date, "%Y-%m-%d")
     before = start_date - relativedelta(days=look_back_days)
     before = before.strftime("%Y-%m-%d")
@@ -141,6 +189,7 @@ def get_finnhub_news(
             )
             combined_result += current_news + "\n\n"
 
+    print(f"[TIMING] get_finnhub_news[{ticker}] total: {time.time() - t0:.2f}s")
     return f"## {ticker} News, from {before} to {curr_date}:\n" + str(combined_result)
 
 
@@ -161,6 +210,7 @@ def get_finnhub_company_insider_sentiment(
         str: a report of the sentiment in the past 15 days starting at curr_date
     """
 
+    t0 = time.time()
     date_obj = datetime.strptime(curr_date, "%Y-%m-%d")
     before = date_obj - relativedelta(days=look_back_days)
     before = before.strftime("%Y-%m-%d")
@@ -178,6 +228,7 @@ def get_finnhub_company_insider_sentiment(
                 result_str += f"### {entry['year']}-{entry['month']}:\nChange: {entry['change']}\nMonthly Share Purchase Ratio: {entry['mspr']}\n\n"
                 seen_dicts.append(entry)
 
+    print(f"[TIMING] get_finnhub_company_insider_sentiment[{ticker}] total: {time.time() - t0:.2f}s")
     return (
         f"## {ticker} Insider Sentiment Data for {before} to {curr_date}:\n"
         + result_str
@@ -202,6 +253,7 @@ def get_finnhub_company_insider_transactions(
         str: a report of the company's insider transaction/trading informtaion in the past 15 days
     """
 
+    t0 = time.time()
     date_obj = datetime.strptime(curr_date, "%Y-%m-%d")
     before = date_obj - relativedelta(days=look_back_days)
     before = before.strftime("%Y-%m-%d")
@@ -220,6 +272,7 @@ def get_finnhub_company_insider_transactions(
                 result_str += f"### Filing Date: {entry['filingDate']}, {entry['name']}:\nChange:{entry['change']}\nShares: {entry['share']}\nTransaction Price: {entry['transactionPrice']}\nTransaction Code: {entry['transactionCode']}\n\n"
                 seen_dicts.append(entry)
 
+    print(f"[TIMING] get_finnhub_company_insider_transactions[{ticker}] total: {time.time() - t0:.2f}s")
     return (
         f"## {ticker} insider transactions from {before} to {curr_date}:\n"
         + result_str
@@ -235,6 +288,7 @@ def get_simfin_balance_sheet(
     ],
     curr_date: Annotated[str, "current date you are trading at, yyyy-mm-dd"],
 ):
+    t0 = time.time()
     data_path = os.path.join(
         DATA_DIR,
         "fundamental_data",
@@ -267,6 +321,7 @@ def get_simfin_balance_sheet(
     # drop the SimFinID column
     latest_balance_sheet = latest_balance_sheet.drop("SimFinId")
 
+    print(f"[TIMING] get_simfin_balance_sheet[{ticker},{freq}] total: {time.time() - t0:.2f}s")
     return (
         f"## {freq} balance sheet for {ticker} released on {str(latest_balance_sheet['Publish Date'])[0:10]}: \n"
         + str(latest_balance_sheet)
@@ -282,6 +337,7 @@ def get_simfin_cashflow(
     ],
     curr_date: Annotated[str, "current date you are trading at, yyyy-mm-dd"],
 ):
+    t0 = time.time()
     data_path = os.path.join(
         DATA_DIR,
         "fundamental_data",
@@ -314,6 +370,7 @@ def get_simfin_cashflow(
     # drop the SimFinID column
     latest_cash_flow = latest_cash_flow.drop("SimFinId")
 
+    print(f"[TIMING] get_simfin_cashflow[{ticker},{freq}] total: {time.time() - t0:.2f}s")
     return (
         f"## {freq} cash flow statement for {ticker} released on {str(latest_cash_flow['Publish Date'])[0:10]}: \n"
         + str(latest_cash_flow)
@@ -329,6 +386,7 @@ def get_simfin_income_statements(
     ],
     curr_date: Annotated[str, "current date you are trading at, yyyy-mm-dd"],
 ):
+    t0 = time.time()
     data_path = os.path.join(
         DATA_DIR,
         "fundamental_data",
@@ -361,6 +419,7 @@ def get_simfin_income_statements(
     # drop the SimFinID column
     latest_income = latest_income.drop("SimFinId")
 
+    print(f"[TIMING] get_simfin_income_statements[{ticker},{freq}] total: {time.time() - t0:.2f}s")
     return (
         f"## {freq} income statement for {ticker} released on {str(latest_income['Publish Date'])[0:10]}: \n"
         + str(latest_income)
@@ -373,6 +432,7 @@ def get_google_news(
     curr_date: Annotated[str, "Curr date in yyyy-mm-dd format"],
     look_back_days: Annotated[int, "how many days to look back"],
 ) -> str:
+    t0 = time.time()
     query = query.replace(" ", "+")
 
     start_date = datetime.strptime(curr_date, "%Y-%m-%d")
@@ -391,6 +451,7 @@ def get_google_news(
     if len(news_results) == 0:
         return ""
 
+    print(f"[TIMING] get_google_news[{query}] total: {time.time() - t0:.2f}s")
     return f"## {query} Google News, from {before} to {curr_date}:\n\n{news_str}"
 
 
@@ -407,6 +468,7 @@ def get_reddit_global_news(
     Returns:
         str: A formatted dataframe containing the latest news articles posts on reddit and meta information in these columns: "created_utc", "id", "title", "selftext", "score", "num_comments", "url"
     """
+    t0 = time.time()
 
     start_date = datetime.strptime(start_date, "%Y-%m-%d")
     before = start_date - relativedelta(days=look_back_days)
@@ -443,6 +505,7 @@ def get_reddit_global_news(
         else:
             news_str += f"### {post['title']}\n\n{post['content']}\n\n"
 
+    print(f"[TIMING] get_reddit_global_news total: {time.time() - t0:.2f}s")
     return f"## Global News Reddit, from {before} to {curr_date}:\n{news_str}"
 
 
@@ -461,7 +524,7 @@ def get_reddit_company_news(
     Returns:
         str: A formatted dataframe containing the latest news articles posts on reddit and meta information in these columns: "created_utc", "id", "title", "selftext", "score", "num_comments", "url"
     """
-
+    t0 = time.time()
     start_date = datetime.strptime(start_date, "%Y-%m-%d")
     before = start_date - relativedelta(days=look_back_days)
     before = before.strftime("%Y-%m-%d")
@@ -502,6 +565,7 @@ def get_reddit_company_news(
         else:
             news_str += f"### {post['title']}\n\n{post['content']}\n\n"
 
+    print(f"[TIMING] get_reddit_company_news[{ticker}] total: {time.time() - t0:.2f}s")
     return f"##{ticker} News Reddit, from {before} to {curr_date}:\n\n{news_str}"
 
 
@@ -517,6 +581,7 @@ def get_stock_stats_indicators_window(
     online: Annotated[bool, "to fetch data online or offline"],
 ) -> str:
 
+    t0 = time.time()
     best_ind_params = {
         # Moving Averages
         "close_50_sma": (
@@ -640,6 +705,7 @@ def get_stock_stats_indicators_window(
         + best_ind_params.get(indicator, "No description available.")
     )
 
+    print(f"[TIMING] get_stock_stats_indicators_window[{symbol},{indicator}] total: {time.time() - t0:.2f}s")
     return result_str
 
 
@@ -656,6 +722,7 @@ def get_stock_stats_multi_indicators_window(
     single-indicator implementation. This keeps semantics identical while
     enabling higher-level tools to make **one** call for many indicators.
     """
+    t0 = time.time()
     norm_inds = [i.strip() for i in indicators if isinstance(i, str) and i.strip()]
     if not norm_inds:
         return ""
@@ -669,6 +736,7 @@ def get_stock_stats_multi_indicators_window(
         except Exception as e:
             parts.append(f"## {ind} error: {e}")
     print(f"[INTERFACE] Completed stock stats (BATCH) for {symbol}")
+    print(f"[TIMING] get_stock_stats_multi_indicators_window[{symbol}] total: {time.time() - t0:.2f}s")
     return "\n\n".join(parts)
 
 
@@ -706,6 +774,7 @@ def get_YFin_data_window(
     curr_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     look_back_days: Annotated[int, "how many days to look back"],
 ) -> str:
+    t0 = time.time()
     # calculate past days
     date_obj = datetime.strptime(curr_date, "%Y-%m-%d")
     before = date_obj - relativedelta(days=look_back_days)
@@ -736,6 +805,7 @@ def get_YFin_data_window(
     ):
         df_string = filtered_data.to_string()
 
+    print(f"[TIMING] get_YFin_data_window[{symbol}] total: {time.time() - t0:.2f}s")
     return (
         f"## Raw Market Data for {symbol} from {start_date} to {curr_date}:\n\n"
         + df_string
@@ -748,6 +818,7 @@ def get_YFin_data_online(
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
 ):
 
+    t0 = time.time()
     datetime.strptime(start_date, "%Y-%m-%d")
     datetime.strptime(end_date, "%Y-%m-%d")
 
@@ -781,6 +852,7 @@ def get_YFin_data_online(
     header += f"# Total records: {len(data)}\n"
     header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
+    print(f"[TIMING] get_YFin_data_online[{symbol}] total: {time.time() - t0:.2f}s")
     return header + csv_string
 
 
@@ -789,6 +861,7 @@ def get_YFin_data(
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
 ) -> str:
+    t0 = time.time()
     # read in data
     data = pd.read_csv(
         os.path.join(
@@ -816,17 +889,19 @@ def get_YFin_data(
     # remove the index from the dataframe
     filtered_data = filtered_data.reset_index(drop=True)
 
+    print(f"[TIMING] get_YFin_data[{symbol}] total: {time.time() - t0:.2f}s")
     return filtered_data
 
 
 def get_stock_news_openai(ticker, curr_date):
+    t0 = time.time()
     config = get_config()
-    client = create_openai_client_with_custom_retry()
+    client = create_openai_client_with_custom_retry(purpose=f"stock_news:{ticker}")
 
     cache_rel = Path("stock") / ticker.upper() / f"{curr_date}.txt"
     cached = _cache_read(cache_rel)
     if cached:
-        print(f"[INTERFACE][CACHE HIT] stock news for {ticker} on {curr_date}")
+        print(f"[INTERFACE][CACHE HIT] stock news for {ticker} on {curr_date} — {time.time() - t0:.2f}s")
         return cached
 
     curr_dt_obj = datetime.strptime(curr_date, "%Y-%m-%d")
@@ -858,6 +933,7 @@ Just provide the raw information, no analysis or opinions.
 """.strip()
 
     try:
+        api_start = time.time()
         resp = _responses_with_retries(
             client.responses.create,
             model=config["openai_model"],
@@ -868,29 +944,35 @@ Just provide the raw information, no analysis or opinions.
             top_p=1,
             store=True,
         )
+        print(f"[TIMING] OpenAI Responses API call: {time.time() - api_start:.2f}s")
         text = _extract_text(resp)
         _cache_write(cache_rel, text)
+        print(f"[TIMING] get_stock_news_openai[{ticker}] total: {time.time() - t0:.2f}s")
         return text
     except Exception as e:
         # Fallback: try Google News (no LLM) to keep pipeline moving
-        print(f"[INTERFACE][FALLBACK] stock news via Google News due to: {e}")
+        fail_elapsed = time.time() - t0
+        print(f"[INTERFACE][FALLBACK] stock news via Google News due to: {e} — after {fail_elapsed:.2f}s")
         try:
             text = get_google_news(ticker, curr_date, 14)
             if text:
                 _cache_write(cache_rel, text)
+            print(f"[TIMING] get_stock_news_openai[{ticker}] total: {time.time() - t0:.2f}s")
             return text
         except Exception:
+            print(f"[TIMING] get_stock_news_openai[{ticker}] total: {time.time() - t0:.2f}s")
             return ""
 
 
 def get_global_news_openai(curr_date):
+    t0 = time.time()
     config = get_config()
-    client = create_openai_client_with_custom_retry()
+    client = create_openai_client_with_custom_retry(purpose="global_news")
 
     cache_rel = Path("global") / f"{curr_date}.txt"
     cached = _cache_read(cache_rel)
     if cached:
-        print(f"[INTERFACE][CACHE HIT] global news for {curr_date}")
+        print(f"[INTERFACE][CACHE HIT] global news for {curr_date} — {time.time() - t0:.2f}s")
         return cached
 
     curr_dt_obj = datetime.strptime(curr_date, "%Y-%m-%d")
@@ -919,6 +1001,7 @@ Just provide the raw information, no analysis or commentary.
 """.strip()
 
     try:
+        api_start = time.time()
         resp = _responses_with_retries(
             client.responses.create,
             model=config["openai_model"],
@@ -929,23 +1012,28 @@ Just provide the raw information, no analysis or commentary.
             top_p=1,
             store=True,
         )
+        print(f"[TIMING] OpenAI Responses API call: {time.time() - api_start:.2f}s")
         text = _extract_text(resp)
         _cache_write(cache_rel, text)
+        print(f"[TIMING] get_global_news_openai total: {time.time() - t0:.2f}s")
         return text
     except Exception as e:
-        print(f"[INTERFACE][FALLBACK] global news via Google News due to: {e}")
+        fail_elapsed = time.time() - t0
+        print(f"[INTERFACE][FALLBACK] global news via Google News due to: {e} — after {fail_elapsed:.2f}s")
         try:
             text = get_google_news("global markets", curr_date, 14)
             if text:
                 _cache_write(cache_rel, text)
+            print(f"[TIMING] get_global_news_openai total: {time.time() - t0:.2f}s")
             return text
         except Exception:
+            print(f"[TIMING] get_global_news_openai total: {time.time() - t0:.2f}s")
             return ""
 
 
 def get_fundamentals_openai(ticker, curr_date):
     config = get_config()
-    client = create_openai_client_with_custom_retry() 
+    client = create_openai_client_with_custom_retry(purpose=f"fundamentals:{ticker}") 
 
     instructions = f"""
 You are a meticulous FINANCIAL-DATA ASSISTANT.

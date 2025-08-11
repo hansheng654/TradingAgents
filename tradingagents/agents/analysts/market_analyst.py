@@ -6,6 +6,7 @@ import json
 def create_market_analyst(llm, toolkit):
 
     def market_analyst_node(state):
+        node_start = time.time()
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
         company_name = state["company_of_interest"]
@@ -77,15 +78,20 @@ Volume-Based Indicators:
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(ticker=ticker)
 
+        chain_start = time.time()
         chain = prompt | llm.bind_tools(tools)
+        print(f"[TIMING] {ticker} Market Analyst chain setup: {time.time() - chain_start:.2f}s")
 
+        invoke_start = time.time()
         result = chain.invoke(state["messages"])
+        print(f"[TIMING] {ticker} Market Analyst LLM invoke: {time.time() - invoke_start:.2f}s")
 
         report = ""
 
         if len(result.tool_calls) == 0:
             report = result.content
 
+        print(f"[TIMING] {ticker} Market Analyst total: {time.time() - node_start:.2f}s")
         return {
             "messages": [result],
             "market_report": report,

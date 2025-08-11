@@ -3,6 +3,7 @@ import hashlib
 import threading
 from collections import OrderedDict
 from typing import List, Tuple
+import time
 
 try:
     import tiktoken
@@ -149,6 +150,7 @@ class FinancialSituationMemory:
 
     def get_embedding(self, text):
         """Get embedding for text using the configured API with caching and safe chunking."""
+        start_time = time.time()
         norm_text = _normalize_text(text or "")
         # Determine a conservative per-provider chunk size (tokens)
         # Keep 8k default for OpenAI; keep 8k-ish approximation for Google as we count with tiktoken fallback.
@@ -163,6 +165,7 @@ class FinancialSituationMemory:
                 # move to end (LRU)
                 self._embed_cache.move_to_end(cache_key)
                 self.metrics["cache_hits"] += 1
+                print(f"[TIMING] Embedding cache hit: {time.time() - start_time:.2f}s")
                 return self._embed_cache[cache_key]
 
         # Helper to insert into cache with LRU eviction
@@ -178,29 +181,38 @@ class FinancialSituationMemory:
             total_tokens = _count_tokens(norm_text)
             if total_tokens <= max_tokens:
                 if self.api_type == "openai":
+                    api_start = time.time()
                     resp = self.client.embeddings.create(
                         model=self.embedding, input=norm_text
                     )
+                    print(f"[TIMING] Embedding API call: {time.time() - api_start:.2f}s")
                     vec = resp.data[0].embedding
                 elif self.api_type == "google":
+                    api_start = time.time()
                     vecs = self.google_embeddings.embed_documents([norm_text])
+                    print(f"[TIMING] Embedding API call: {time.time() - api_start:.2f}s")
                     vec = vecs[0]
                 else:
                     raise ValueError(f"Unsupported api_type: {self.api_type}")
                 self.metrics["embed_calls"] += 1
                 _cache_put(cache_key, vec)
+                print(f"[TIMING] Total embedding time: {time.time() - start_time:.2f}s")
                 return vec
 
             # Oversized: chunk + token-weighted pool
             chunk_vecs: List[Tuple[List[float], int]] = []
             for chunk_text, tok_count in _chunk_for_embedding(norm_text, max_tokens):
                 if self.api_type == "openai":
+                    api_start = time.time()
                     resp = self.client.embeddings.create(
                         model=self.embedding, input=chunk_text
                     )
+                    print(f"[TIMING] Embedding API call: {time.time() - api_start:.2f}s")
                     vec = resp.data[0].embedding
                 elif self.api_type == "google":
+                    api_start = time.time()
                     vecs = self.google_embeddings.embed_documents([chunk_text])
+                    print(f"[TIMING] Embedding API call: {time.time() - api_start:.2f}s")
                     vec = vecs[0]
                 else:
                     raise ValueError(f"Unsupported api_type: {self.api_type}")
@@ -209,8 +221,10 @@ class FinancialSituationMemory:
 
             pooled = _weighted_mean_pool(chunk_vecs)
             _cache_put(cache_key, pooled)
+            print(f"[TIMING] Total embedding time: {time.time() - start_time:.2f}s")
             return pooled
         except Exception as e:
+            print(f"[TIMING] Embedding failed after {time.time() - start_time:.2f}s")
             # Do not cache failures; surface the error
             print(f"Embedding error ({self.api_type}/{self.embedding}): {e}")
             raise

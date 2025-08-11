@@ -5,6 +5,8 @@ import json
 
 def create_social_media_analyst(llm, toolkit):
     def social_media_analyst_node(state):
+        node_start = time.time()
+
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
         company_name = state["company_of_interest"]
@@ -43,14 +45,20 @@ def create_social_media_analyst(llm, toolkit):
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(ticker=ticker)
 
+        chain_start = time.time()
         chain = prompt | llm.bind_tools(tools)
+        print(f"[TIMING] {ticker} Social Media Analyst chain setup: {time.time() - chain_start:.2f}s")
 
+        invoke_start = time.time()
         result = chain.invoke(state["messages"])
+        print(f"[TIMING] {ticker} Social Media Analyst LLM invoke: {time.time() - invoke_start:.2f}s")
 
         report = ""
 
         if len(result.tool_calls) == 0:
             report = result.content
+
+        print(f"[TIMING] {ticker} Social Media Analyst total: {time.time() - node_start:.2f}s")
 
         return {
             "messages": [result],
